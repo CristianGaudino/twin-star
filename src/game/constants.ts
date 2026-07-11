@@ -78,6 +78,11 @@ export const DRILL_SIG_PER_SEC = 15;
 // tool switches, flying off, and re-anchoring, only resetting when the section is fully
 // extracted (or fractured by other means).
 
+// Drill fracture visual: the crack network grows in discrete generations (see
+// Engine.generateFractures) — shared with the renderer so the reveal band lines up exactly
+// with how the data was generated.
+export const DRILL_FRACTURE_GENERATIONS = 7;
+
 // Charges: place then remotely detonate; each detonated cell is extracted whole.
 export const CHARGE_RANGE = 150;
 export const CHARGE_SIG_PER_USE = 22;

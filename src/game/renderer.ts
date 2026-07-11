@@ -9,6 +9,7 @@ import {
   CONTACT_FADE_DURATION,
   CONTACT_FORGET_AFTER,
   DRILL_ANCHOR_RANGE,
+  DRILL_FRACTURE_GENERATIONS,
   PING_MAX_RADIUS,
   SCAN_DATA_DISPLAY_RANGE,
   SCAN_RANGE,
@@ -146,51 +147,37 @@ export class Renderer {
         ctx.fill();
       }
 
-      if (cell.crackBranches && cell.boreProgress > 0) {
+      if (cell.fractures && cell.boreProgress > 0) {
         this.renderCracks(ctx, toScreen, cell);
       }
     }
   }
 
-  /** Draws the drill fracture pattern for a cell mid-bore. Each branch radiates from the
-   *  anchor point (see `generateCrackBranches`) and grows outward in its own band of
-   *  `boreProgress` — branch `i` of `n` starts growing at `i/n` and is fully drawn by
-   *  `(i+1)/n` — so the crack visibly spreads as drilling proceeds instead of popping in
-   *  all at once. Points are stored cell-local and converted to world space here so they
-   *  stay glued to the rock as it drifts/spins (`cellLocalToWorld`). */
+  /** Draws the drill fracture network for a cell mid-bore (see `Engine.generateFractures`).
+   *  Every hairline segment carries its own generation-based `order`, so segments from every
+   *  branch reveal together as `boreProgress` climbs — the whole network visibly spreads and
+   *  forks outward at once rather than one arm completing before the next starts. Points are
+   *  stored cell-local and converted to world space here so they stay glued to the rock as it
+   *  drifts/spins (`cellLocalToWorld`). */
   private renderCracks(ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2, cell: Cell) {
-    const branches = cell.crackBranches!;
-    const n = branches.length;
-    ctx.strokeStyle = "rgba(18,14,12,0.85)";
-    ctx.lineWidth = 1.6;
-    for (let i = 0; i < n; i++) {
-      const vis = Math.max(0, Math.min(1, (cell.boreProgress - i / n) / (1 / n)));
+    const segments = cell.fractures!;
+    if (segments.length === 0) return;
+    const band = 1 / DRILL_FRACTURE_GENERATIONS;
+    ctx.strokeStyle = "rgba(12,10,9,0.75)";
+    ctx.lineWidth = 1;
+    for (const seg of segments) {
+      const vis = Math.max(0, Math.min(1, (cell.boreProgress - seg.order) / band));
       if (vis <= 0) continue;
-      const worldPoints = branches[i].map((p) => cellLocalToWorld(cell, p));
-      this.drawPartialPolyline(ctx, toScreen, worldPoints, vis);
+      const a = cellLocalToWorld(cell, seg.a);
+      const b = cellLocalToWorld(cell, seg.b);
+      const end = vis >= 1 ? b : add(a, scale(sub(b, a), vis));
+      const pa = toScreen(a);
+      const pb = toScreen(end);
+      ctx.beginPath();
+      ctx.moveTo(pa.x, pa.y);
+      ctx.lineTo(pb.x, pb.y);
+      ctx.stroke();
     }
-  }
-
-  private drawPartialPolyline(
-    ctx: CanvasRenderingContext2D,
-    toScreen: (p: Vec2) => Vec2,
-    points: Vec2[],
-    fraction: number,
-  ) {
-    const segCount = points.length - 1;
-    if (segCount <= 0) return;
-    const grownT = fraction * segCount;
-    ctx.beginPath();
-    const p0 = toScreen(points[0]);
-    ctx.moveTo(p0.x, p0.y);
-    for (let s = 0; s < segCount; s++) {
-      if (grownT <= s) break;
-      const segFrac = Math.min(1, grownT - s);
-      const end = segFrac >= 1 ? points[s + 1] : add(points[s], scale(sub(points[s + 1], points[s]), segFrac));
-      const p = toScreen(end);
-      ctx.lineTo(p.x, p.y);
-    }
-    ctx.stroke();
   }
 
   private renderChunk(ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2, chunk: Chunk) {

@@ -1,6 +1,6 @@
 import { InputState } from "./input";
 import { Ship } from "./ship";
-import { Asteroid, Cell, COMPOSITION_INFO, LocalPoint, cellWorldToLocal } from "./asteroid";
+import { Asteroid, Cell, COMPOSITION_INFO, CrackSegment, cellWorldToLocal } from "./asteroid";
 import { Chunk } from "./chunk";
 import { Contact, ContactMemory } from "./contacts";
 import { Explosion } from "./explosion";
@@ -36,6 +36,7 @@ import {
   CONTACT_FORGET_AFTER,
   DRIFT_DAMPING,
   DRILL_ANCHOR_RANGE,
+  DRILL_FRACTURE_GENERATIONS,
   DRILL_SIG_PER_SEC,
   LASER_CUT_DEPTH,
   LASER_SIG_PER_SEC,
@@ -881,8 +882,8 @@ export class Engine {
         ship.vel = v2(0, 0);
       }
 
-      if (!validTarget.crackBranches) {
-        this.generateCrackBranches(validTarget);
+      if (!validTarget.fractures && boundary) {
+        this.generateFractures(validTarget, boundary.point);
       }
 
       const info = COMPOSITION_INFO[validTarget.composition];
@@ -913,33 +914,67 @@ export class Engine {
     }
   }
 
-  /** Generates a fixed set of jagged crack branches radiating outward from `originWorld`
-   *  (defaults to the cell's own centroid — see `runDrill`), stored in the cell's own rotating
-   *  local frame so they stay glued to their spot on the rock as the piece drifts and spins —
-   *  see `cellLocalToWorld`. Persists on the cell itself, so it survives the piece being split
-   *  into a different drift group. Every generated point is clamped to stay inside the cell's
-   *  own polygon (`clampInsidePolygon`), so fractures never visually spill into a neighboring
-   *  section or open space — kept general (any origin, any cause) so future sources besides
-   *  drilling (e.g. an impact) can raise fractures from their own point of contact too. */
-  private generateCrackBranches(cell: Cell, originWorld: Vec2 = cell.centroid) {
+  /** Grows a hairline fracture network outward from `originWorld` — the ship's actual point of
+   *  contact on the cell's surface, so damage reads as coming from where it happened (a future
+   *  impact/blast could raise fractures from its own contact point the same way). Modeled as a
+   *  handful of random walkers that wander, occasionally fork into two, and occasionally fizzle
+   *  out — a small Lichtenberg-figure-style branching walk — rather than a fixed spoke of
+   *  straight lines, so it reads as an actual spreading crack instead of a wheel. Every walker
+   *  step is clamped to stay inside the cell's own polygon (`clampInsidePolygon`) and stops
+   *  there, so fractures never spill into a neighboring section or open space. Segments are
+   *  stored flat with a generation-based `order` (see `CrackSegment`) so the whole network grows
+   *  together in the renderer rather than one branch completing before the next starts. Points
+   *  are kept in the cell's own rotating local frame (`cellWorldToLocal`) so the fracture stays
+   *  glued to that spot as the piece drifts and spins, and persists across drift-group splits
+   *  since it lives on the `Cell` itself. */
+  private generateFractures(cell: Cell, originWorld: Vec2) {
+    // The origin must be strictly inside the polygon for the containment clamp below to have a
+    // safe anchor — the drill's contact point sits right on the boundary, so nudge it slightly
+    // inward first.
+    const origin = add(originWorld, scale(sub(cell.centroid, originWorld), 0.08));
+
     const cellRadius = boundingRadius(cell.polygon, cell.centroid);
-    const branchCount = 3 + Math.floor(Math.random() * 2);
-    const branches: LocalPoint[][] = [];
-    for (let i = 0; i < branchCount; i++) {
-      let dir = (i / branchCount) * Math.PI * 2 + (Math.random() - 0.5) * 1.4;
-      const segments = 2 + Math.floor(Math.random() * 2);
-      let curWorld = originWorld;
-      const points: LocalPoint[] = [cellWorldToLocal(cell, curWorld)];
-      for (let s = 0; s < segments; s++) {
-        dir += (Math.random() - 0.5) * 0.9;
-        const segLen = (cellRadius / segments) * (0.55 + Math.random() * 0.5);
-        const candidate = add(curWorld, fromAngle(dir, segLen));
-        curWorld = clampInsidePolygon(cell.polygon, curWorld, candidate);
-        points.push(cellWorldToLocal(cell, curWorld));
-      }
-      branches.push(points);
+    const stepLen = cellRadius * 0.14;
+    const maxGenerations = DRILL_FRACTURE_GENERATIONS;
+
+    interface Walker {
+      pos: Vec2;
+      dir: number;
     }
-    cell.crackBranches = branches;
+    let walkers: Walker[] = [];
+    const seedCount = 2 + Math.floor(Math.random() * 2);
+    for (let i = 0; i < seedCount; i++) {
+      walkers.push({ pos: origin, dir: Math.random() * Math.PI * 2 });
+    }
+
+    const segments: CrackSegment[] = [];
+    for (let gen = 0; gen < maxGenerations && walkers.length > 0; gen++) {
+      const next: Walker[] = [];
+      for (const w of walkers) {
+        const dir = w.dir + (Math.random() - 0.5) * 1.2;
+        const candidate = add(w.pos, fromAngle(dir, stepLen * (0.6 + Math.random() * 0.8)));
+        const end = clampInsidePolygon(cell.polygon, w.pos, candidate);
+        segments.push({
+          a: cellWorldToLocal(cell, w.pos),
+          b: cellWorldToLocal(cell, end),
+          order: gen / maxGenerations,
+        });
+
+        const hitEdge = distance(end, candidate) > 1e-3;
+        if (hitEdge) continue; // this hairline reached the surface — stop growing it
+
+        const roll = Math.random();
+        if (roll < 0.2 && gen < maxGenerations - 1) {
+          next.push({ pos: end, dir: dir + 0.5 + Math.random() * 0.6 });
+          next.push({ pos: end, dir: dir - 0.5 - Math.random() * 0.6 });
+        } else if (roll < 0.9) {
+          next.push({ pos: end, dir });
+        }
+        // else: this hairline fizzles out here
+      }
+      walkers = next;
+    }
+    cell.fractures = segments;
   }
 
   private detonateCharges() {

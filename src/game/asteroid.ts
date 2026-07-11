@@ -63,7 +63,7 @@ export interface Cell {
   hasCharge: boolean;
   cutProgress: number; // laser: accumulated beam-seconds toward the next cut
   boreProgress: number; // drill: 0..1
-  crackBranches: LocalPoint[][] | null; // drill fracture visual — see cellLocalToWorld
+  fractures: CrackSegment[] | null; // drill fracture visual — see cellLocalToWorld
   shade: string; // pre-scan rock color, varied per cell so the body reads as textured, not flat
 }
 
@@ -78,6 +78,16 @@ export interface Cell {
 export interface LocalPoint {
   a: number;
   b: number;
+}
+
+/** One hairline of a fracture network — see `Engine.generateFractures`. `order` is the 0..1
+ *  point in `boreProgress` at which this segment finishes growing in, so segments from every
+ *  branch at the same "generation" reveal together and the crack visibly spreads and forks as
+ *  a whole rather than completing one arm at a time. */
+export interface CrackSegment {
+  a: LocalPoint;
+  b: LocalPoint;
+  order: number;
 }
 
 function cellBasis(cell: Cell): { x: Vec2; y: Vec2 } {
@@ -228,7 +238,7 @@ export class Asteroid {
         hasCharge: false,
         cutProgress: 0,
         boreProgress: 0,
-        crackBranches: null,
+        fractures: null,
         shade: `rgb(${tone},${tone},${tone + 4})`,
       });
     }
