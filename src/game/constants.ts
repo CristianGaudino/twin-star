@@ -92,6 +92,7 @@ export const CHARGE_IMPULSE_PER_CHARGE = 9000; // mass-units*px/s, divided by gr
 export const CHARGE_BLAST_RADIUS = 90; // px
 export const CHARGE_BLAST_DAMAGE_MAX = 18; // hull damage at point-blank, falls off to 0 at the radius edge
 export const CHARGE_BLAST_PUSH_MAX = 220; // px/s knockback at point-blank
+export const CHARGE_CHUNK_PUSH_MAX = 260; // px/s knockback for loose chunks at point-blank — light debris flies far
 export const BLAST_VISUAL_DURATION = 0.5; // seconds, shockwave ring + flash lifetime
 
 export const SIGNATURE_DECAY_PER_SEC = 10;
@@ -100,6 +101,7 @@ export const SIGNATURE_DECAY_PER_SEC = 10;
 export const CHUNK_DRAG = 0.15;
 export const CHUNK_COLLECT_RADIUS = 16;
 export const CHUNK_SHIP_BUMP_RESTITUTION = 0.6; // uncollected chunks bounce off the ship, no damage
+export const CHUNK_CHUNK_RESTITUTION = 0.5; // chunks bounce off each other too
 
 // --- Drift groups ---
 // Every connected cluster of intact cells is a full 2D rigid body — center of

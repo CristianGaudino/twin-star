@@ -1,4 +1,4 @@
-import { Vec2, add, distance, fromAngle, scale, sub } from "./vec2";
+import { Vec2, add, distance, dot, fromAngle, normalize, scale, sub, v2 } from "./vec2";
 import { Polygon, clipHalfPlane, pointInPolygon, polygonArea, polygonCentroid } from "./poly";
 import { ASTEROID_BASE_RADIUS, ASTEROID_OUTLINE_POINTS, ASTEROID_SEED_COUNT } from "./constants";
 import { ToolId } from "./tools";
@@ -63,7 +63,38 @@ export interface Cell {
   hasCharge: boolean;
   cutProgress: number; // laser: accumulated beam-seconds toward the next cut
   boreProgress: number; // drill: 0..1
+  crackBranches: LocalPoint[][] | null; // drill fracture visual — see cellLocalToWorld
   shade: string; // pre-scan rock color, varied per cell so the body reads as textured, not flat
+}
+
+/** A point expressed relative to a cell's own centroid, in a basis built from
+ *  (centroid -> polygon[0]) and its perpendicular — i.e. it rotates and translates
+ *  *with* the cell automatically, since that basis is recomputed from the cell's own
+ *  current geometry every time. Used for drill cracks, which must stay glued to a
+ *  specific spot on the rock even as the piece drifts and spins. Only valid for the
+ *  lifetime of a cell's polygon identity (safe across drift/rotation, not across the
+ *  cell being re-sliced by the laser — but a cell is never lasered while being drilled,
+ *  they're mutually exclusive actions on the same target). */
+export interface LocalPoint {
+  a: number;
+  b: number;
+}
+
+function cellBasis(cell: Cell): { x: Vec2; y: Vec2 } {
+  let x = normalize(sub(cell.polygon[0], cell.centroid));
+  if (x.x === 0 && x.y === 0) x = v2(1, 0);
+  return { x, y: v2(-x.y, x.x) };
+}
+
+export function cellLocalToWorld(cell: Cell, p: LocalPoint): Vec2 {
+  const { x, y } = cellBasis(cell);
+  return add(cell.centroid, add(scale(x, p.a), scale(y, p.b)));
+}
+
+export function cellWorldToLocal(cell: Cell, point: Vec2): LocalPoint {
+  const { x, y } = cellBasis(cell);
+  const rel = sub(point, cell.centroid);
+  return { a: dot(rel, x), b: dot(rel, y) };
 }
 
 const pickComposition = (roll: number): Composition => {
@@ -197,6 +228,7 @@ export class Asteroid {
         hasCharge: false,
         cutProgress: 0,
         boreProgress: 0,
+        crackBranches: null,
         shade: `rgb(${tone},${tone},${tone + 4})`,
       });
     }

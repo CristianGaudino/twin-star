@@ -1,5 +1,5 @@
 import type { Engine } from "./engine";
-import { Cell, COMPOSITION_INFO } from "./asteroid";
+import { Cell, COMPOSITION_INFO, cellLocalToWorld } from "./asteroid";
 import { Chunk } from "./chunk";
 import { ContactMemory } from "./contacts";
 import { TOOLS, ToolId } from "./tools";
@@ -146,14 +146,51 @@ export class Renderer {
         ctx.fill();
       }
 
-      if (cell.boreProgress > 0) {
-        ctx.strokeStyle = "#ffb35c";
-        ctx.lineWidth = 3;
-        ctx.beginPath();
-        ctx.arc(centroid.x, centroid.y, 10, -Math.PI / 2, -Math.PI / 2 + cell.boreProgress * Math.PI * 2);
-        ctx.stroke();
+      if (cell.crackBranches && cell.boreProgress > 0) {
+        this.renderCracks(ctx, toScreen, cell);
       }
     }
+  }
+
+  /** Draws the drill fracture pattern for a cell mid-bore. Each branch radiates from the
+   *  anchor point (see `generateCrackBranches`) and grows outward in its own band of
+   *  `boreProgress` — branch `i` of `n` starts growing at `i/n` and is fully drawn by
+   *  `(i+1)/n` — so the crack visibly spreads as drilling proceeds instead of popping in
+   *  all at once. Points are stored cell-local and converted to world space here so they
+   *  stay glued to the rock as it drifts/spins (`cellLocalToWorld`). */
+  private renderCracks(ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2, cell: Cell) {
+    const branches = cell.crackBranches!;
+    const n = branches.length;
+    ctx.strokeStyle = "rgba(18,14,12,0.85)";
+    ctx.lineWidth = 1.6;
+    for (let i = 0; i < n; i++) {
+      const vis = Math.max(0, Math.min(1, (cell.boreProgress - i / n) / (1 / n)));
+      if (vis <= 0) continue;
+      const worldPoints = branches[i].map((p) => cellLocalToWorld(cell, p));
+      this.drawPartialPolyline(ctx, toScreen, worldPoints, vis);
+    }
+  }
+
+  private drawPartialPolyline(
+    ctx: CanvasRenderingContext2D,
+    toScreen: (p: Vec2) => Vec2,
+    points: Vec2[],
+    fraction: number,
+  ) {
+    const segCount = points.length - 1;
+    if (segCount <= 0) return;
+    const grownT = fraction * segCount;
+    ctx.beginPath();
+    const p0 = toScreen(points[0]);
+    ctx.moveTo(p0.x, p0.y);
+    for (let s = 0; s < segCount; s++) {
+      if (grownT <= s) break;
+      const segFrac = Math.min(1, grownT - s);
+      const end = segFrac >= 1 ? points[s + 1] : add(points[s], scale(sub(points[s + 1], points[s]), segFrac));
+      const p = toScreen(end);
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
   }
 
   private renderChunk(ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2, chunk: Chunk) {

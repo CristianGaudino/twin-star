@@ -1,8 +1,9 @@
 import { InputState } from "./input";
 import { Ship } from "./ship";
-import { Asteroid, Cell, COMPOSITION_INFO } from "./asteroid";
+import { Asteroid, Cell, COMPOSITION_INFO, LocalPoint, cellWorldToLocal } from "./asteroid";
 import { Chunk } from "./chunk";
 import { Contact, ContactMemory } from "./contacts";
+import { Explosion } from "./explosion";
 import { TOOLS, ToolId } from "./tools";
 import {
   BoundaryHit,
@@ -24,9 +25,11 @@ import {
   CHARGE_BLAST_DAMAGE_MAX,
   CHARGE_BLAST_PUSH_MAX,
   CHARGE_BLAST_RADIUS,
+  CHARGE_CHUNK_PUSH_MAX,
   CHARGE_IMPULSE_PER_CHARGE,
   CHARGE_MAX_CARRIED,
   CHARGE_SIG_PER_USE,
+  CHUNK_CHUNK_RESTITUTION,
   CHUNK_COLLECT_RADIUS,
   CHUNK_SHIP_BUMP_RESTITUTION,
   CONTACT_FORGET_AFTER,
@@ -258,6 +261,15 @@ export class Engine {
     this.activeBeam = null;
     this.updateMining(dt, worldMouse);
 
+    // Any cell mid-bore that isn't the one actively anchored right now erodes over
+    // time — whatever the reason drilling stopped (switched tools, flew off, aimed
+    // elsewhere), abandoning it should always bleed progress, not just while still
+    // hovering over it with the drill selected.
+    for (const cell of asteroid.cells) {
+      if (cell.fractured || cell.boreProgress <= 0 || cell === this.anchoredCell) continue;
+      cell.boreProgress = Math.max(0, cell.boreProgress - dt * DRILL_PROGRESS_DECAY);
+    }
+
     ship.decaySignature(dt, SIGNATURE_DECAY_PER_SEC);
 
     this.blastEffects = this.blastEffects.filter((b) => {
@@ -269,6 +281,7 @@ export class Engine {
     this.cargoFullMessageCooldown = Math.max(0, this.cargoFullMessageCooldown - dt);
     for (const chunk of this.chunks) chunk.update(dt);
     this.resolveChunkCollisions();
+    this.resolveChunkChunkCollisions();
     this.chunks = this.chunks.filter((chunk) => {
       const d = distance(chunk.pos, ship.pos);
       if (d < SHIP_RADIUS + CHUNK_COLLECT_RADIUS) {
@@ -595,6 +608,38 @@ export class Engine {
     }
   }
 
+  /** Loose chunks bump each other instead of passing through — simple circle-circle physics,
+   *  no rotation (chunks only need real linear momentum; their spin is purely cosmetic). */
+  private resolveChunkChunkCollisions() {
+    for (let i = 0; i < this.chunks.length; i++) {
+      for (let j = i + 1; j < this.chunks.length; j++) {
+        this.resolveChunkPair(this.chunks[i], this.chunks[j]);
+      }
+    }
+  }
+
+  private resolveChunkPair(a: Chunk, b: Chunk) {
+    const d = distance(a.pos, b.pos);
+    const minDist = a.radius + b.radius;
+    if (d >= minDist || d < 1e-6) return;
+
+    const normal = scale(sub(a.pos, b.pos), 1 / d);
+    const penetration = minDist - d;
+    const massA = a.radius * a.radius;
+    const massB = b.radius * b.radius;
+    const totalMass = massA + massB;
+
+    a.pos = add(a.pos, scale(normal, penetration * (massB / totalMass)));
+    b.pos = sub(b.pos, scale(normal, penetration * (massA / totalMass)));
+
+    const relVel = sub(a.vel, b.vel);
+    const closingSpeed = -dot(relVel, normal);
+    if (closingSpeed <= 0) return;
+    const impulse = closingSpeed * CHUNK_CHUNK_RESTITUTION;
+    a.vel = add(a.vel, scale(normal, impulse * (massB / totalMass)));
+    b.vel = sub(b.vel, scale(normal, impulse * (massA / totalMass)));
+  }
+
   /** Chunks the ship couldn't collect (cargo full) still physically bump it — no damage. */
   private resolveChunkShipBumps() {
     const { ship } = this;
@@ -845,6 +890,10 @@ export class Engine {
         ship.vel = v2(0, 0);
       }
 
+      if (boundary && (!validTarget.crackBranches || validTarget.boreProgress <= 0)) {
+        this.generateCrackBranches(validTarget, boundary.point);
+      }
+
       const info = COMPOSITION_INFO[validTarget.composition];
       const mult = info.recommendedTool === "drill" ? TOOL_RECOMMENDED_MULT : TOOL_OFF_MULT;
       validTarget.boreProgress += (dt * mult) / info.boreSeconds;
@@ -859,7 +908,9 @@ export class Engine {
       }
     } else {
       // Letting go — keep whatever momentum the rock had at that point (including
-      // its spin) rather than snapping to a dead stop.
+      // its spin) rather than snapping to a dead stop. Bore progress itself now
+      // decays generically every frame (see update()) rather than only here, so
+      // abandoning a drill erodes it regardless of where the mouse ends up.
       if (releasingFrom) {
         const group = this.driftGroupOf(releasingFrom);
         if (group) {
@@ -869,10 +920,32 @@ export class Engine {
         }
       }
       ship.anchored = false;
-      if (validTarget) {
-        validTarget.boreProgress = Math.max(0, validTarget.boreProgress - dt * DRILL_PROGRESS_DECAY);
-      }
     }
+  }
+
+  /** Generates a fixed set of jagged crack branches radiating from `originWorld` (the anchor
+   *  point), stored in the cell's own rotating local frame so they stay glued to that spot on
+   *  the rock as the piece drifts and spins — see `cellLocalToWorld`. Persists on the cell
+   *  itself, so it survives the piece being split into a different drift group. */
+  private generateCrackBranches(cell: Cell, originWorld: Vec2) {
+    const origin = cellWorldToLocal(cell, originWorld);
+    const cellRadius = boundingRadius(cell.polygon, cell.centroid);
+    const branchCount = 3 + Math.floor(Math.random() * 2);
+    const branches: LocalPoint[][] = [];
+    for (let i = 0; i < branchCount; i++) {
+      let dir = (i / branchCount) * Math.PI * 2 + (Math.random() - 0.5) * 1.4;
+      const segments = 2 + Math.floor(Math.random() * 2);
+      const points: LocalPoint[] = [origin];
+      let cur = origin;
+      for (let s = 0; s < segments; s++) {
+        dir += (Math.random() - 0.5) * 0.9;
+        const segLen = (cellRadius / segments) * (0.55 + Math.random() * 0.5);
+        cur = { a: cur.a + Math.cos(dir) * segLen, b: cur.b + Math.sin(dir) * segLen };
+        points.push(cur);
+      }
+      branches.push(points);
+    }
+    cell.crackBranches = branches;
   }
 
   private detonateCharges() {
@@ -884,46 +957,28 @@ export class Engine {
     }
 
     const blastPositions = charged.map((c) => c.centroid);
-    let shipHit = false;
 
-    for (const blastPos of blastPositions) {
-      this.blastEffects.push({ pos: blastPos, timer: BLAST_VISUAL_DURATION });
-
-      const shipDist = distance(ship.pos, blastPos);
-      if (shipDist <= CHARGE_BLAST_RADIUS) {
-        shipHit = true;
-        const falloff = 1 - shipDist / CHARGE_BLAST_RADIUS;
-        const damage = CHARGE_BLAST_DAMAGE_MAX * falloff;
-        if (damage > 0.2) ship.takeImpact(damage);
-        const pushDir = shipDist > 1e-6 ? normalize(sub(ship.pos, blastPos)) : v2(1, 0);
-        ship.vel = add(ship.vel, scale(pushDir, CHARGE_BLAST_PUSH_MAX * falloff));
-      }
-    }
-
-    // Extract everything first, so if this blast splits the body, the drift
-    // groups we recoil below reflect the pieces that actually result from it.
+    // Extract everything first, so the explosions below (which each push whichever
+    // rock body they land nearest) react to the pieces that actually result — if
+    // this blast splits the body, each half recoils from the blast(s) nearest it.
     for (const cell of charged) {
       cell.hasCharge = false;
       this.extractWholeCell(cell, 210 + Math.random() * 60);
     }
-
     this.recomputeDriftGroups();
 
-    // Each blast pushes whichever resulting piece it actually ended up next
-    // to — so if this detonation split the body in half, each half recoils
-    // away from the blast(s) nearest it. Several charges on the same piece
-    // stack additively (more charges = stronger push), and since the impulse
-    // is applied at the actual blast point rather than the center of mass, an
-    // off-center charge also imparts spin — a lopsided blast induces tumble.
-    for (const blastPos of blastPositions) {
-      const group = this.nearestDriftGroup(blastPos);
-      if (!group) continue;
-      const body = this.rigidRefForGroup(group);
-      const dir = normalize(sub(body.pos, blastPos));
-      const impulse = scale(dir, CHARGE_IMPULSE_PER_CHARGE);
-      const applied = applyPointImpulse(body, blastPos, impulse);
-      group.vel = applied.vel;
-      group.angularVelocity = applied.angVel;
+    let shipHit = false;
+    for (const pos of blastPositions) {
+      const hit = this.applyExplosion({
+        pos,
+        radius: CHARGE_BLAST_RADIUS,
+        shipDamage: CHARGE_BLAST_DAMAGE_MAX,
+        shipPushSpeed: CHARGE_BLAST_PUSH_MAX,
+        chunkPushSpeed: CHARGE_CHUNK_PUSH_MAX,
+        rockImpulse: CHARGE_IMPULSE_PER_CHARGE,
+        source: "charge",
+      });
+      if (hit) shipHit = true;
     }
 
     ship.addSignature(CHARGE_SIG_PER_USE * charged.length);
@@ -933,6 +988,48 @@ export class Engine {
         : `DETONATED ${charged.length} CHARGE${charged.length > 1 ? "S" : ""}`,
       shipHit ? "#ff6b6b" : "#ffa25c",
     );
+  }
+
+  /** Generic explosion handling — anything that raises an Explosion gets the same treatment:
+   *  a visible shockwave, ship damage + knockback, loose chunks flung outward, and the nearest
+   *  rock body recoiling from the blast point (off-center hits induce spin, same as any other
+   *  impulse in this game). Charges are the only source today; future ones (enemies, hazards,
+   *  other weapons) should build an Explosion and call this rather than reimplementing it.
+   *  Returns whether the ship was caught in the blast. */
+  applyExplosion(explosion: Explosion): boolean {
+    const { ship } = this;
+    this.blastEffects.push({ pos: explosion.pos, timer: BLAST_VISUAL_DURATION });
+
+    let shipHit = false;
+    const shipDist = distance(ship.pos, explosion.pos);
+    if (shipDist <= explosion.radius) {
+      shipHit = true;
+      const falloff = 1 - shipDist / explosion.radius;
+      const damage = explosion.shipDamage * falloff;
+      if (damage > 0.2) ship.takeImpact(damage);
+      const pushDir = shipDist > 1e-6 ? normalize(sub(ship.pos, explosion.pos)) : v2(1, 0);
+      ship.vel = add(ship.vel, scale(pushDir, explosion.shipPushSpeed * falloff));
+    }
+
+    for (const chunk of this.chunks) {
+      const d = distance(chunk.pos, explosion.pos);
+      if (d > explosion.radius) continue;
+      const falloff = 1 - d / explosion.radius;
+      const pushDir = d > 1e-6 ? normalize(sub(chunk.pos, explosion.pos)) : v2(1, 0);
+      chunk.vel = add(chunk.vel, scale(pushDir, explosion.chunkPushSpeed * falloff));
+    }
+
+    const group = this.nearestDriftGroup(explosion.pos);
+    if (group) {
+      const body = this.rigidRefForGroup(group);
+      const dir = normalize(sub(body.pos, explosion.pos));
+      const impulse = scale(dir, explosion.rockImpulse);
+      const applied = applyPointImpulse(body, explosion.pos, impulse);
+      group.vel = applied.vel;
+      group.angularVelocity = applied.angVel;
+    }
+
+    return shipHit;
   }
 
   private nearestDriftGroup(pos: Vec2): DriftGroup | undefined {
