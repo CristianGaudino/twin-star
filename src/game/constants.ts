@@ -110,6 +110,11 @@ export const CHUNK_COLLECT_RADIUS = 16;
 export const CHUNK_SHIP_BUMP_RESTITUTION = 0.6; // uncollected chunks bounce off the ship, no damage
 export const CHUNK_CHUNK_RESTITUTION = 0.5; // chunks bounce off each other too
 
+// --- Cursor hover (see hover.ts) ---
+// Extra forgiveness around a chunk's small collision radius so hovering one with the
+// mouse doesn't require pixel-perfect aim.
+export const HOVER_CHUNK_PADDING = 6; // px
+
 // --- Drift groups ---
 // Every connected cluster of intact cells is a full 2D rigid body — center of
 // mass, moment of inertia (derived from cell area/placement), linear velocity,

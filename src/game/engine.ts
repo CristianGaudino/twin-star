@@ -4,6 +4,7 @@ import { Asteroid, Cell, COMPOSITION_INFO, CrackSegment, cellWorldToLocal } from
 import { Chunk } from "./chunk";
 import { Contact, ContactMemory } from "./contacts";
 import { Explosion } from "./explosion";
+import { HoverTarget } from "./hover";
 import { TOOLS, ToolId } from "./tools";
 import {
   BoundaryHit,
@@ -36,6 +37,7 @@ import {
   DRIFT_DAMPING,
   DRILL_ANCHOR_RANGE,
   DRILL_FRACTURE_GENERATIONS,
+  HOVER_CHUNK_PADDING,
   LASER_CUT_DEPTH,
   MAX_HULL,
   MIN_CELL_AREA,
@@ -120,7 +122,8 @@ export class Engine {
   private cargoFullMessageCooldown = 0;
 
   activeBeam: { from: Vec2; to: Vec2; tool: ToolId } | null = null;
-  currentTarget: Cell | null = null; // read by Renderer for target highlight/HUD, mutated only here
+  currentTarget: Cell | null = null; // tool-specific: range/mode-gated, drives actual mining behavior
+  hoverTarget: HoverTarget | null = null; // generic: whatever's under the cursor, any mode, any tool — see hover.ts
   blastEffects: { pos: Vec2; timer: number }[] = []; // read by Renderer for the shockwave visual
   private anchoredCell: Cell | null = null;
   private driftGroups: DriftGroup[] = [];
@@ -194,6 +197,10 @@ export class Engine {
     const worldMouse = this.screenToWorld(input.mouseScreen);
     ship.updateMovement(dt, input, worldMouse);
     this.resolveAsteroidCollision(dt);
+
+    // Cursor highlighting is informational only — unlike tool targeting (currentTarget,
+    // set in updateMining) it doesn't care what's selected or which mode the ship is in.
+    this.hoverTarget = this.computeHoverTarget(worldMouse);
 
     // --- sensors: ping + passive close-range detection ---
     // Both sweep the *current* contact list, so a piece that's drifted away after a
@@ -780,6 +787,19 @@ export class Engine {
     return this.driftGroups.find((g) => g.cells.includes(cell));
   }
 
+  /** Whatever's directly under the cursor, checked closest-first (a chunk sitting on top of
+   *  the asteroid should win over the cell behind it). Independent of tool/mode — see
+   *  `HoverTarget`. */
+  private computeHoverTarget(worldMouse: Vec2): HoverTarget | null {
+    const chunk = this.chunks.find(
+      (c) => distance(c.pos, worldMouse) <= c.radius + HOVER_CHUNK_PADDING,
+    );
+    if (chunk) return { kind: "chunk", chunk };
+
+    const cell = this.asteroid.cellAt(worldMouse);
+    return cell ? { kind: "cell", cell } : null;
+  }
+
   private updateMining(dt: number, worldMouse: Vec2) {
     const { ship, asteroid, input } = this;
     this.currentTarget = null;
@@ -788,6 +808,15 @@ export class Engine {
       return;
     }
 
+    // Drilling is decided by ship proximity, not the cursor — see runDrill.
+    if (ship.selectedTool === "drill") {
+      this.runDrill(dt);
+      return;
+    }
+
+    ship.anchored = false;
+    this.anchoredCell = null;
+
     const toolDef = TOOLS[ship.selectedTool];
     const inRange = distance(ship.pos, worldMouse) <= toolDef.range;
     const cell = inRange ? asteroid.cellAt(worldMouse) : null;
@@ -795,14 +824,8 @@ export class Engine {
     if (validCell) this.currentTarget = validCell;
 
     if (ship.selectedTool === "laser") {
-      ship.anchored = false;
-      this.anchoredCell = null;
       if (input.mouseDown && validCell) this.cutCell(validCell, dt);
-    } else if (ship.selectedTool === "drill") {
-      this.runDrill(validCell, dt);
     } else {
-      ship.anchored = false;
-      this.anchoredCell = null;
       if (
         input.mouseJustPressed &&
         validCell &&
@@ -853,21 +876,42 @@ export class Engine {
     cell.centroid = polygonCentroid(result.remainder);
   }
 
-  private runDrill(validTarget: Cell | null, dt: number) {
+  /** Finds the intact cell whose exposed surface the ship is currently close enough to anchor
+   *  to (within `DRILL_ANCHOR_RANGE`). Ship-position-based, not cursor-based — drilling is
+   *  about physical contact with the rock, not aim, so unlike the laser/charges (which target
+   *  wherever you point) the drill anchors to whatever you're actually touching, regardless of
+   *  where the cursor happens to be. */
+  private nearestDrillableCell(): { cell: Cell; boundary: BoundaryHit } | null {
+    let best: { cell: Cell; boundary: BoundaryHit } | null = null;
+    let bestDist = DRILL_ANCHOR_RANGE;
+    for (const cell of this.asteroid.cells) {
+      if (cell.fractured) continue;
+      const mask = this.exposedEdgeMask(cell);
+      const boundary = closestPointOnPolygon(cell.polygon, this.ship.pos, (i) => mask[i]);
+      if (!boundary || boundary.distance > bestDist) continue;
+      bestDist = boundary.distance;
+      best = { cell, boundary };
+    }
+    return best;
+  }
+
+  private runDrill(dt: number) {
     const { ship, input } = this;
     const releasingFrom = ship.anchored ? this.anchoredCell : null;
 
-    if (this.anchoredCell && this.anchoredCell !== validTarget) {
+    // Speed gate disabled for now — a fast-moving/spinning drift group made anchoring
+    // impossible since the ship has to match its speed just to stay in range.
+    const nearby = this.nearestDrillableCell();
+    this.currentTarget = nearby?.cell ?? null;
+
+    if (this.anchoredCell && nearby?.cell !== this.anchoredCell) {
       this.anchoredCell = null;
     }
 
-    const boundary = validTarget ? closestBoundaryPoint(validTarget.polygon, ship.pos) : null;
-    const withinAnchorRange = boundary ? boundary.distance <= DRILL_ANCHOR_RANGE : false;
-    // Speed gate disabled for now — a fast-moving/spinning drift group made anchoring
-    // impossible since the ship has to match its speed just to stay in range.
-    const canAnchor = !!validTarget && withinAnchorRange && input.mouseDown;
+    const canAnchor = !!nearby && input.mouseDown;
 
-    if (canAnchor && validTarget) {
+    if (canAnchor && nearby) {
+      const { cell: validTarget, boundary } = nearby;
       ship.anchored = true;
       this.anchoredCell = validTarget;
 
@@ -885,7 +929,7 @@ export class Engine {
         ship.vel = v2(0, 0);
       }
 
-      if (!validTarget.fractures && boundary) {
+      if (!validTarget.fractures) {
         this.generateFractures(validTarget, boundary.point);
       }
 
@@ -893,7 +937,7 @@ export class Engine {
       const mult = info.recommendedTool === "drill" ? TOOL_RECOMMENDED_MULT : TOOL_OFF_MULT;
       validTarget.boreProgress += (dt * mult) / info.boreSeconds;
       ship.addSignature((TOOLS.drill.sigPerSecond ?? 0) * dt);
-      if (boundary) this.activeBeam = { from: ship.pos, to: boundary.point, tool: "drill" };
+      this.activeBeam = { from: ship.pos, to: boundary.point, tool: "drill" };
 
       if (validTarget.boreProgress >= 1) {
         this.extractWholeCell(validTarget, 40 + Math.random() * 20);

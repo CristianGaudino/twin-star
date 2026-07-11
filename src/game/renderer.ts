@@ -55,6 +55,10 @@ export class Renderer {
       ctx.stroke();
     }
     for (const chunk of engine.chunks) this.renderChunk(ctx, toScreen, chunk);
+    // Cursor highlighting is its own top-level pass — deliberately independent of tool/mode
+    // (see hover.ts) and drawn after everything it might highlight, so it's never obscured
+    // by e.g. a cell's own drill-fracture lines.
+    this.renderHoverHighlight(engine, ctx, toScreen);
     this.renderBlastEffects(engine, ctx, toScreen);
 
     if (engine.activeBeam) {
@@ -97,7 +101,6 @@ export class Renderer {
 
   private renderAsteroid(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
     const { asteroid } = engine;
-    const target = engine.currentTarget;
     const sweeping = !asteroid.scanned && asteroid.scanProgress > 0;
     const sweepRadius = asteroid.scanProgress * asteroid.outerRadius;
 
@@ -115,7 +118,6 @@ export class Renderer {
       }
       ctx.closePath();
 
-      const isTarget = target === cell;
       ctx.fillStyle = cell.shade;
       ctx.globalAlpha = 0.88;
       ctx.fill();
@@ -129,12 +131,6 @@ export class Renderer {
         ctx.fill();
         ctx.strokeStyle = "rgba(160,230,255,0.85)";
         ctx.lineWidth = 1.4;
-        ctx.stroke();
-      }
-
-      if (isTarget) {
-        ctx.strokeStyle = "#ffffff";
-        ctx.lineWidth = 2;
         ctx.stroke();
       }
 
@@ -196,6 +192,58 @@ export class Renderer {
     ctx.fill();
     ctx.stroke();
     ctx.restore();
+  }
+
+  /** Outlines + labels whatever `engine.hoverTarget` currently is (see hover.ts) — a cell or a
+   *  chunk, entirely independent of the selected tool or ship mode. This is the *only* place
+   *  a "you're looking at X" highlight is drawn; tool targeting (currentTarget) still gates
+   *  actual mining behavior but no longer owns any of this visual. */
+  private renderHoverHighlight(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+    const hover = engine.hoverTarget;
+    if (!hover) return;
+
+    let label: string;
+    if (hover.kind === "cell") {
+      this.strokePolygon(ctx, toScreen, hover.cell.polygon, "#ffffff", 2);
+      label = engine.asteroid.scanned
+        ? COMPOSITION_INFO[hover.cell.composition].label
+        : "unidentified";
+    } else {
+      const p = toScreen(hover.chunk.pos);
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, hover.chunk.radius + 4, 0, Math.PI * 2);
+      ctx.stroke();
+      label = COMPOSITION_INFO[hover.chunk.composition].label;
+    }
+
+    const cursor = toScreen(engine.screenToWorld(engine.input.mouseScreen));
+    ctx.font = "11px monospace";
+    ctx.textAlign = "left";
+    ctx.fillStyle = "rgba(230,232,238,0.85)";
+    ctx.fillText(label, cursor.x + 14, cursor.y - 12);
+  }
+
+  private strokePolygon(
+    ctx: CanvasRenderingContext2D,
+    toScreen: (p: Vec2) => Vec2,
+    poly: Vec2[],
+    color: string,
+    lineWidth: number,
+  ) {
+    if (poly.length < 3) return;
+    ctx.beginPath();
+    const p0 = toScreen(poly[0]);
+    ctx.moveTo(p0.x, p0.y);
+    for (let i = 1; i < poly.length; i++) {
+      const p = toScreen(poly[i]);
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.closePath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.stroke();
   }
 
   private renderBlastEffects(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
@@ -261,17 +309,23 @@ export class Renderer {
   }
 
   private renderReticle(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
-    const { ship, input, asteroid } = engine;
+    const { ship, input } = engine;
     const worldMouse = engine.screenToWorld(input.mouseScreen);
     const toolDef = TOOLS[ship.selectedTool];
     const valid = !!engine.currentTarget;
 
     const shipScreen = toScreen(ship.pos);
-    ctx.strokeStyle = "rgba(255,255,255,0.15)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.arc(shipScreen.x, shipScreen.y, toolDef.range, 0, Math.PI * 2);
-    ctx.stroke();
+
+    // The drill no longer cares where the cursor points — it anchors to whatever the ship is
+    // physically close to (the orange anchor-range circle below), so the generic aim-range
+    // circle other tools use would be actively misleading here and is skipped.
+    if (ship.selectedTool !== "drill") {
+      ctx.strokeStyle = "rgba(255,255,255,0.15)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(shipScreen.x, shipScreen.y, toolDef.range, 0, Math.PI * 2);
+      ctx.stroke();
+    }
 
     if (ship.selectedTool === "drill") {
       ctx.strokeStyle = "rgba(255,179,92,0.35)";
@@ -283,15 +337,6 @@ export class Renderer {
     const p = toScreen(worldMouse);
     const color = valid ? "#7de08d" : "#888";
     this.renderToolCursor(ctx, p, ship.selectedTool, color);
-
-    // cursor-side popup: material name only, nothing else
-    if (engine.currentTarget) {
-      const label = asteroid.scanned ? COMPOSITION_INFO[engine.currentTarget.composition].label : "unidentified";
-      ctx.font = "11px monospace";
-      ctx.textAlign = "left";
-      ctx.fillStyle = "rgba(230,232,238,0.8)";
-      ctx.fillText(label, p.x + 14, p.y - 12);
-    }
   }
 
   /** Each tool gets its own reticle shape, so what you're aiming with is obvious at a glance
