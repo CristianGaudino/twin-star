@@ -39,6 +39,19 @@ A recurring smell: a mechanic implemented only inside the one call site that cur
 
 Left alone on purpose: `Cell.hasCharge` is charge-specific boolean state on a cell. It looks like the same smell, but there's only ever been one thing that attaches to a cell — generalizing to a device-type enum now would be designing for a feature that doesn't exist. Rule of three still applies.
 
+Also generalized: cursor highlighting used to be tool-specific (`currentTarget`, range/mode-gated, drove both actual mining *and* the visual outline). Split into two concepts — `Engine.currentTarget` still drives mining eligibility, but `Engine.hoverTarget`/`hover.ts` is a new, independent "what's under the cursor" query that runs every frame regardless of tool or mode, and covers chunks as well as cells. The white outline + tooltip moved to their own render pass (`Renderer.renderHoverHighlight`) drawn after everything else, which as a side effect fixed a z-order bug (drill fracture lines used to render on top of the old per-cell highlight stroke).
+
+## Done: one mass system for every collision (this session)
+
+Found while auditing the above pattern: the ship had *two* masses. `SHIP_MASS = 30` was the real constant, used in ship-vs-rock — but `resolveChunkShipBumps` independently invented `SHIP_RADIUS * SHIP_RADIUS * 4` (324, a 10x disagreement) rather than using it. Chunk mass was `radius * radius` with no density constant at all, calibrated against nothing. Three unrelated mass conventions for what should be one physical model — almost certainly the concrete cause of the "big things push too easily, size/mass doesn't matter" note in the spec.
+
+Fixed by making mass a single well-defined property per body type, used everywhere that body collides:
+- `Engine.rigidRefForShip()` — the only place `SHIP_MASS` is read into a `RigidRef`.
+- `Chunk.mass` (getter) — shares `ROCK_MASS_PER_AREA` with rock cells (a chunk is the same material, just detached), computed from its circular radius. This means a chunk is now properly much lighter than the cell it came from, on the same scale rock mass already used.
+- `Engine.rigidRefForChunk()` — the only place a chunk's mass is read.
+
+With real `RigidRef`s for ship and chunk now available, chunk-vs-rock, chunk-vs-chunk, and chunk-vs-ship were all migrated off their old hand-rolled circle-circle mass-ratio math onto the same `resolveContact` (physics.ts) every other collision in the game already uses. Chunk-vs-rock in particular used to be purely kinematic (chunk bounces off a fixed normal, rock never reacts) — it now exchanges real momentum with the rock's drift-group body, so a chunk resting on a spinning piece gets carried/flung the same way the ship does. One resolver, one mass system, five collision pairs (ship-rock, rock-rock, chunk-rock, chunk-chunk, chunk-ship) — the next new pairing (an enemy, eventually) has one obvious place to plug in rather than a sixth reimplementation.
+
 ## Not done yet, flagged for later
 
 **Scene/mode concept.** Everything currently assumes "always in the field" — there's no notion of being docked at a hub. The spec's own core loop (§3) starts with "dock at hub," and that doesn't exist at all yet. The moment it's built, `Engine` (or something above it) needs a mode switch (field vs. hub) that the current flat structure doesn't have. Not building this preemptively — it's speculative until the hub actually exists — but noting it so the next pass isn't a surprise.

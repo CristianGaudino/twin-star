@@ -18,9 +18,14 @@ export const COLLISION_MIN_SPEED = 55; // below this, a bump does no damage
 export const COLLISION_RESTITUTION = 0.45; // bounce-back factor
 export const POSITION_CORRECTION_RATE = 20; // per second — fraction of overlap closed each tick, smooths the pop-out
 
-// Mass units for collision impulses (ship vs rock). Rock mass is derived from
-// its area, so a single loose cell feels roughly ship-weight while the full
-// asteroid is heavy enough to barely register a nudge from one hit.
+// One mass system, shared by every collision in the game (see physics.ts's RigidRef/
+// resolveContact, used for all of ship-rock, rock-rock, chunk-rock, chunk-chunk, and
+// chunk-ship). SHIP_MASS is the ship's one fixed mass, used everywhere the ship collides —
+// never recomputed ad hoc per collision type. ROCK_MASS_PER_AREA converts polygon area to
+// mass and is shared by rock cells *and* chunks (a chunk is the same material, just no
+// longer attached to a larger body), so a single loose cell feels roughly ship-weight, a
+// small broken-off chunk is properly much lighter than either, and the full asteroid is
+// heavy enough to barely register a nudge from one hit.
 export const SHIP_MASS = 30;
 export const ROCK_MASS_PER_AREA = 0.01; // px^2 -> mass
 
@@ -69,10 +74,6 @@ export const LASER_CUT_DEPTH = 20; // px carved inward per cut
 // on completion, extracts the entire cell as one large core chunk.
 export const DRILL_RANGE = 60;
 export const DRILL_ANCHOR_RANGE = 26; // max ship-to-surface distance to stay anchored
-// Currently unused: anchoring no longer gates on ship speed (a fast/spinning
-// drift group made anchoring impossible since the ship has to match its speed
-// just to stay in range). Revisit with a relative-velocity check if needed.
-export const DRILL_ANCHOR_MAX_SPEED = 30; // px/s
 export const DRILL_SIG_PER_SEC = 15;
 // Bore progress is persistent — once you've drilled into a section it stays put across
 // tool switches, flying off, and re-anchoring, only resetting when the section is fully
@@ -109,6 +110,7 @@ export const CHUNK_DRAG = 0.15;
 export const CHUNK_COLLECT_RADIUS = 16;
 export const CHUNK_SHIP_BUMP_RESTITUTION = 0.6; // uncollected chunks bounce off the ship, no damage
 export const CHUNK_CHUNK_RESTITUTION = 0.5; // chunks bounce off each other too
+export const CHUNK_ROCK_RESTITUTION = 0.5; // and off the asteroid surface itself
 
 // --- Cursor hover (see hover.ts) ---
 // Extra forgiveness around a chunk's small collision radius so hovering one with the

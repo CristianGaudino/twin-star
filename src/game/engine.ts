@@ -32,6 +32,7 @@ import {
   CHARGE_MAX_CARRIED,
   CHUNK_CHUNK_RESTITUTION,
   CHUNK_COLLECT_RADIUS,
+  CHUNK_ROCK_RESTITUTION,
   CHUNK_SHIP_BUMP_RESTITUTION,
   CONTACT_FORGET_AFTER,
   DRIFT_DAMPING,
@@ -276,8 +277,8 @@ export class Engine {
     // --- chunks ---
     this.cargoFullMessageCooldown = Math.max(0, this.cargoFullMessageCooldown - dt);
     for (const chunk of this.chunks) chunk.update(dt);
-    this.resolveChunkCollisions();
-    this.resolveChunkChunkCollisions();
+    this.resolveChunkCollisions(dt);
+    this.resolveChunkChunkCollisions(dt);
     this.chunks = this.chunks.filter((chunk) => {
       const d = distance(chunk.pos, ship.pos);
       if (d < SHIP_RADIUS + CHUNK_COLLECT_RADIUS) {
@@ -297,7 +298,7 @@ export class Engine {
       }
       return true;
     });
-    this.resolveChunkShipBumps();
+    this.resolveChunkShipBumps(dt);
 
     if (this.message) {
       this.message.timer -= dt;
@@ -413,7 +414,7 @@ export class Engine {
 
     const group = this.driftGroupOf(cell);
     const rockBody = this.rigidRefForGroup(group);
-    const shipBody: RigidRef = { pos: ship.pos, vel: ship.vel, angVel: 0, invMass: 1 / SHIP_MASS, invInertia: 0 };
+    const shipBody = this.rigidRefForShip();
 
     const rB = sub(boundary.point, rockBody.pos);
     const contactVelRock = velocityAtPoint(rockBody.vel, rockBody.angVel, rB);
@@ -569,6 +570,22 @@ export class Engine {
     };
   }
 
+  /** The ship's rigid-body reference, built fresh from its current position/velocity each
+   *  call — `SHIP_MASS` is the one place the ship's mass is ever defined, so every collision
+   *  the ship takes part in (ship-rock, chunk-ship) reacts to the same physical weight. Never
+   *  spins from a hit (invInertia 0) — the ship's orientation is player/thruster-controlled. */
+  private rigidRefForShip(): RigidRef {
+    const { ship } = this;
+    return { pos: ship.pos, vel: ship.vel, angVel: 0, invMass: 1 / SHIP_MASS, invInertia: 0 };
+  }
+
+  /** A chunk's rigid-body reference — `Chunk.mass` (shared density with rock, see
+   *  ROCK_MASS_PER_AREA) is the one place a chunk's mass is defined. No rotational coupling
+   *  (invInertia 0): a chunk's spin is purely cosmetic and never exchanged in a collision. */
+  private rigidRefForChunk(chunk: Chunk): RigidRef {
+    return { pos: chunk.pos, vel: chunk.vel, angVel: 0, invMass: 1 / chunk.mass, invInertia: 0 };
+  }
+
   private groupBoundingRadius(group: DriftGroup, com: Vec2): number {
     let maxR = 0;
     for (const cell of group.cells) {
@@ -593,57 +610,76 @@ export class Engine {
     });
   }
 
-  /** Keeps drifting/collected chunks from passing straight through solid rock. */
-  private resolveChunkCollisions() {
+  /** Keeps drifting/collected chunks from passing straight through solid rock — a real
+   *  two-body contact against the rock's actual velocity and spin, the same as ship-vs-rock,
+   *  so a chunk resting on a spinning piece gets carried/flung by it instead of only ever
+   *  reacting to its own velocity. */
+  private resolveChunkCollisions(dt: number) {
     for (const chunk of this.chunks) {
       const contact = this.findCellContact(chunk.pos, chunk.radius);
       if (!contact) continue;
-      const { boundary } = contact;
+      const { cell, boundary } = contact;
 
       // Same fix as the ship: resting distance must match the radius findCellContact
       // used to detect the contact, or the chunk can never fully clear "touching."
-      chunk.pos = add(boundary.point, scale(boundary.normal, chunk.radius + 0.5));
-      const radial = dot(chunk.vel, boundary.normal);
-      if (radial < 0) {
-        chunk.vel = sub(chunk.vel, scale(boundary.normal, radial * 1.5));
+      const targetPos = add(boundary.point, scale(boundary.normal, chunk.radius + 0.5));
+      const correctionFactor = Math.min(1, POSITION_CORRECTION_RATE * dt);
+      chunk.pos = add(chunk.pos, scale(sub(targetPos, chunk.pos), correctionFactor));
+
+      const group = this.driftGroupOf(cell);
+      const rockBody = this.rigidRefForGroup(group);
+      const chunkBody = this.rigidRefForChunk(chunk);
+
+      const rB = sub(boundary.point, rockBody.pos);
+      const contactVelRock = velocityAtPoint(rockBody.vel, rockBody.angVel, rB);
+      const closingSpeed = -dot(sub(chunk.vel, contactVelRock), boundary.normal);
+      if (closingSpeed <= 0) continue; // already separating
+
+      const result = resolveContact(chunkBody, rockBody, boundary.point, boundary.normal, CHUNK_ROCK_RESTITUTION);
+      chunk.vel = result.velA;
+      if (group) {
+        group.vel = result.velB;
+        group.angularVelocity = result.angVelB;
       }
     }
   }
 
-  /** Loose chunks bump each other instead of passing through — simple circle-circle physics,
-   *  no rotation (chunks only need real linear momentum; their spin is purely cosmetic). */
-  private resolveChunkChunkCollisions() {
+  /** Loose chunks bump each other instead of passing through. No rotational coupling (chunks
+   *  only need real linear momentum; their spin is purely cosmetic) — same shared resolver as
+   *  every other collision in the game, just with invInertia 0 on both sides. */
+  private resolveChunkChunkCollisions(dt: number) {
     for (let i = 0; i < this.chunks.length; i++) {
       for (let j = i + 1; j < this.chunks.length; j++) {
-        this.resolveChunkPair(this.chunks[i], this.chunks[j]);
+        this.resolveChunkPair(this.chunks[i], this.chunks[j], dt);
       }
     }
   }
 
-  private resolveChunkPair(a: Chunk, b: Chunk) {
+  private resolveChunkPair(a: Chunk, b: Chunk, dt: number) {
     const d = distance(a.pos, b.pos);
     const minDist = a.radius + b.radius;
     if (d >= minDist || d < 1e-6) return;
 
     const normal = scale(sub(a.pos, b.pos), 1 / d);
+    const contact = scale(add(a.pos, b.pos), 0.5);
+    const bodyA = this.rigidRefForChunk(a);
+    const bodyB = this.rigidRefForChunk(b);
+
+    const result = resolveContact(bodyA, bodyB, contact, normal, CHUNK_CHUNK_RESTITUTION);
+    a.vel = result.velA;
+    b.vel = result.velB;
+
     const penetration = minDist - d;
-    const massA = a.radius * a.radius;
-    const massB = b.radius * b.radius;
-    const totalMass = massA + massB;
-
-    a.pos = add(a.pos, scale(normal, penetration * (massB / totalMass)));
-    b.pos = sub(b.pos, scale(normal, penetration * (massA / totalMass)));
-
-    const relVel = sub(a.vel, b.vel);
-    const closingSpeed = -dot(relVel, normal);
-    if (closingSpeed <= 0) return;
-    const impulse = closingSpeed * CHUNK_CHUNK_RESTITUTION;
-    a.vel = add(a.vel, scale(normal, impulse * (massB / totalMass)));
-    b.vel = sub(b.vel, scale(normal, impulse * (massA / totalMass)));
+    const totalInv = bodyA.invMass + bodyB.invMass;
+    if (totalInv > 1e-9) {
+      const factor = Math.min(1, POSITION_CORRECTION_RATE * dt);
+      a.pos = add(a.pos, scale(normal, penetration * (bodyA.invMass / totalInv) * factor));
+      b.pos = sub(b.pos, scale(normal, penetration * (bodyB.invMass / totalInv) * factor));
+    }
   }
 
   /** Chunks the ship couldn't collect (cargo full) still physically bump it — no damage. */
-  private resolveChunkShipBumps() {
+  private resolveChunkShipBumps(dt: number) {
     const { ship } = this;
     for (const chunk of this.chunks) {
       const d = distance(ship.pos, chunk.pos);
@@ -651,22 +687,21 @@ export class Engine {
       if (d >= minDist || d < 1e-6) continue;
 
       const normal = scale(sub(ship.pos, chunk.pos), 1 / d);
+      const contact = scale(add(ship.pos, chunk.pos), 0.5);
+      const shipBody = this.rigidRefForShip();
+      const chunkBody = this.rigidRefForChunk(chunk);
+
+      const result = resolveContact(shipBody, chunkBody, contact, normal, CHUNK_SHIP_BUMP_RESTITUTION);
+      ship.vel = result.velA;
+      chunk.vel = result.velB;
+
       const penetration = minDist - d;
-      const chunkMass = chunk.radius * chunk.radius;
-      const shipMass = SHIP_RADIUS * SHIP_RADIUS * 4;
-      const totalMass = chunkMass + shipMass;
-      const shipPush = chunkMass / totalMass;
-      const chunkPush = shipMass / totalMass;
-
-      ship.pos = add(ship.pos, scale(normal, penetration * shipPush));
-      chunk.pos = sub(chunk.pos, scale(normal, penetration * chunkPush));
-
-      const relVel = sub(ship.vel, chunk.vel);
-      const closingSpeed = -dot(relVel, normal);
-      if (closingSpeed <= 0) continue;
-      const impulse = closingSpeed * CHUNK_SHIP_BUMP_RESTITUTION;
-      ship.vel = add(ship.vel, scale(normal, impulse * chunkPush));
-      chunk.vel = sub(chunk.vel, scale(normal, impulse * shipPush));
+      const totalInv = shipBody.invMass + chunkBody.invMass;
+      if (totalInv > 1e-9) {
+        const factor = Math.min(1, POSITION_CORRECTION_RATE * dt);
+        ship.pos = add(ship.pos, scale(normal, penetration * (shipBody.invMass / totalInv) * factor));
+        chunk.pos = sub(chunk.pos, scale(normal, penetration * (chunkBody.invMass / totalInv) * factor));
+      }
     }
   }
 

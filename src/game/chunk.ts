@@ -1,5 +1,5 @@
 import { Vec2, add, scale, v2 } from "./vec2";
-import { CHUNK_DRAG } from "./constants";
+import { CHUNK_DRAG, ROCK_MASS_PER_AREA } from "./constants";
 import { Composition } from "./asteroid";
 
 let nextChunkId = 1;
@@ -40,5 +40,13 @@ export class Chunk {
     this.pos = add(this.pos, scale(this.vel, dt));
     this.vel = scale(this.vel, Math.max(0, 1 - CHUNK_DRAG * dt));
     this.angle += this.spin * dt;
+  }
+
+  /** A chunk is the same material it broke off from, just no longer part of a larger body —
+   *  so it shares the asteroid's density constant (`ROCK_MASS_PER_AREA`) rather than having
+   *  its own disconnected mass convention. Approximated as a circle of `radius` since chunk
+   *  shape is cosmetic (an irregular outline generated only for rendering). */
+  get mass(): number {
+    return Math.max(1, Math.PI * this.radius * this.radius * ROCK_MASS_PER_AREA);
   }
 }
