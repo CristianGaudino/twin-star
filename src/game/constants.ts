@@ -1,3 +1,5 @@
+import { v2 } from "./vec2";
+
 // Tunable gameplay constants. Kept in one place so movement feel can be
 // iterated on quickly without hunting through the engine code.
 
@@ -54,25 +56,55 @@ export const CARGO_CAPACITY = 16;
 // --- Hub ---
 // The home base: a fixed point you dock at to deposit whatever's in the hold. Deliberately no
 // currency conversion — materials are stored as-is, spent directly on whatever needs them
-// later (upgrades, crafting), not abstracted into a number first.
-export const HUB_RADIUS = 34; // px, visual size in the field
-export const HUB_DOCK_RANGE = 70; // px — how close the ship needs to be to dock
+// later (upgrades, crafting), not abstracted into a number first. Sized as a real station —
+// clearly bigger than the ship, bigger than most asteroids too — not a slightly-large rock.
+export const HUB_RADIUS = 160; // px, visual size in the field
+export const HUB_DOCK_RANGE = 260; // px — how close the ship needs to be to dock
+
+// --- World layout (fixed landmarks — see ARCHITECTURE.md) ---
+// Loosely modeled on Sirius: a bright ordinary primary (home star, built here) and a distant,
+// extreme white-dwarf companion (far star — deliberately not built yet). Distances are
+// compressed hard from anything astronomically real; grounded in real astronomy for flavor
+// and asymmetry (spec explicitly wants the two stars to feel different), not literal AU scale.
+export const HOME_STAR_POS = v2(0, -6000); // fixed, near the hub, well inside the belt's inner edge
+export const HOME_STAR_RADIUS = 1100; // visual only, no collision yet
+
+// The asteroid belt is the "normal operating range" around home — its own boundary is a fixed
+// landmark, but what's actually scattered inside it (see Engine's belt scattering) is
+// procedural content, not permanent map geometry, and can grow/regenerate later without
+// touching this geometry.
+export const BELT_INNER_RADIUS = 11000; // px from the hub — nothing spawns closer than this
+export const BELT_OUTER_RADIUS = 95000; // px from the hub — edge of normal operating range
+export const BELT_ASTEROID_COUNT = 9;
 
 // --- Asteroid shape (irregular rock, Voronoi-cell interior) ---
-export const ASTEROID_BASE_RADIUS = 190;
+export const ASTEROID_BASE_RADIUS = 190; // reference size — seed count scales off this, see seedCountForRadius
 export const ASTEROID_OUTLINE_POINTS = 26;
-export const ASTEROID_SEED_COUNT = 32;
+export const ASTEROID_SEED_COUNT = 32; // seed count at ASTEROID_BASE_RADIUS
 export const MIN_CELL_AREA = 90; // px^2 — remainder below this ejects wholesale rather than slicing further
 // Two cells count as still touching if their boundaries are within this distance — checked
 // against current (possibly laser-shrunk) geometry, not just "were they neighbors originally."
 export const CELL_TOUCH_EPSILON = 2;
 
+// A belt should read as varied, not stamped from one template — three rough size classes,
+// picked randomly per asteroid (see Engine's belt scattering).
+export const ASTEROID_SIZE_CLASSES: { min: number; max: number }[] = [
+  { min: 70, max: 140 }, // small
+  { min: 160, max: 280 }, // medium — roughly the old single-asteroid scale
+  { min: 320, max: 500 }, // large
+];
+
 // --- Sensors ---
-export const VISION_RADIUS = 300; // always-visible short range, no ping needed
-export const SCAN_RANGE = 230;
+// Rescaled alongside the belt (see above) — these were tuned for a world a few hundred px
+// across. VISION_RADIUS/SCAN_RANGE needed to grow just to stay usable at real asteroid sizes.
+// PING_MAX_RADIUS deliberately does NOT try to cover meaningful fractions of the belt — it's a
+// short-range "reveal just past the horizon" tool (a bit past typical screen half-diagonal),
+// not a way to skip exploring. Longer range is a future upgrade, not the baseline.
+export const VISION_RADIUS = 900; // always-visible short range, no ping needed
+export const SCAN_RANGE = 350;
 export const PING_COOLDOWN = 4.5; // seconds
-export const PING_SPEED = 900; // px/s expansion speed
-export const PING_MAX_RADIUS = 1600;
+export const PING_SPEED = 1400; // px/s expansion speed
+export const PING_MAX_RADIUS = 3500;
 
 // A ping/proximity contact is a last-known snapshot, not a live track — it goes stale and is
 // eventually forgotten if nothing refreshes it, so radar reflects what you actually know, not
@@ -84,7 +116,10 @@ export const CONTACT_FADE_DURATION = 8; // seconds — the blip fades out over t
 // from the asteroid's center; leaving range or letting go decays progress.
 export const SCAN_HOLD_SECONDS = 1.6;
 export const SCAN_PROGRESS_DECAY = 1.0; // per second, when not actively scanning
-export const SCAN_DATA_DISPLAY_RANGE = 300; // HUD panel hides once you're this far from the asteroid
+// Must comfortably exceed the largest asteroid's radius (see ASTEROID_SIZE_CLASSES) — this is
+// measured from the asteroid's *center*, so sitting right on the surface of a large asteroid
+// already means being several hundred px away from its center.
+export const SCAN_DATA_DISPLAY_RANGE = 800; // HUD panel hides once you're this far from the asteroid
 
 // --- Tools ---
 export const TOOL_RECOMMENDED_MULT = 1.6;

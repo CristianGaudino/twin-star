@@ -1,15 +1,19 @@
 import type { Engine } from "./engine";
-import { Cell, COMPOSITION_INFO, cellLocalToWorld } from "./asteroid";
+import { Asteroid, Cell, COMPOSITION_INFO, cellLocalToWorld } from "./asteroid";
 import { Chunk } from "./chunk";
 import { ContactMemory } from "./contacts";
+import { starsInView } from "./starfield";
 import { TOOLS, ToolId } from "./tools";
 import {
+  BELT_OUTER_RADIUS,
   BLAST_VISUAL_DURATION,
   CHARGE_BLAST_RADIUS,
   CONTACT_FADE_DURATION,
   CONTACT_FORGET_AFTER,
   DRILL_ANCHOR_RANGE,
   DRILL_FRACTURE_GENERATIONS,
+  HOME_STAR_POS,
+  HOME_STAR_RADIUS,
   HUB_DOCK_RANGE,
   HUB_RADIUS,
   PING_MAX_RADIUS,
@@ -28,12 +32,15 @@ import { Vec2, add, distance, normalize, scale, sub, v2 } from "./vec2";
 export class Renderer {
   render(engine: Engine, ctx: CanvasRenderingContext2D, width: number, height: number) {
     if (engine.scene === "hub") {
-      this.renderHubScene(engine, ctx, width, height);
+      // The hub screen itself is a DOM overlay (see HubOverlay.tsx) — canvas just goes to a
+      // plain backdrop behind it.
+      ctx.fillStyle = "#050a12";
+      ctx.fillRect(0, 0, width, height);
       if (engine.paused) this.renderPauseOverlay(ctx, width, height);
       return;
     }
 
-    const { ship, asteroid } = engine;
+    const { ship } = engine;
     const offset = sub(ship.pos, v2(width / 2, height / 2));
     const toScreen = (p: Vec2): Vec2 => sub(p, offset);
 
@@ -41,6 +48,8 @@ export class Renderer {
     ctx.fillRect(0, 0, width, height);
 
     this.renderStars(engine, ctx, toScreen, width, height);
+    this.renderBeltBoundary(engine, ctx, toScreen);
+    this.renderHomeStar(ctx, toScreen);
     this.renderHubMarker(engine, ctx, toScreen);
 
     if (engine.pingActive) {
@@ -53,16 +62,7 @@ export class Renderer {
       ctx.stroke();
     }
 
-    this.renderAsteroid(engine, ctx, toScreen);
-    if (!asteroid.scanned && asteroid.scanProgress > 0) {
-      const c = toScreen(asteroid.center);
-      const r = asteroid.scanProgress * asteroid.outerRadius;
-      ctx.strokeStyle = "rgba(120,220,255,0.55)";
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
-      ctx.stroke();
-    }
+    this.renderAsteroids(engine, ctx, toScreen);
     for (const chunk of engine.chunks) this.renderChunk(ctx, toScreen, chunk);
     // Cursor highlighting is its own top-level pass — deliberately independent of tool/mode
     // (see hover.ts) and drawn after everything it might highlight, so it's never obscured
@@ -98,14 +98,55 @@ export class Renderer {
     width: number,
     height: number,
   ) {
-    for (const star of engine.stars) {
+    // Generated on the fly for whatever's currently visible (see starfield.ts) — a
+    // solar-system-scale map needs stars everywhere a trip might go, not just near the origin.
+    const margin = 60;
+    const originX = engine.ship.pos.x - width / 2;
+    const originY = engine.ship.pos.y - height / 2;
+    const stars = starsInView(originX - margin, originY - margin, originX + width + margin, originY + height + margin);
+    for (const star of stars) {
       const p = toScreen(star.pos);
-      if (p.x < -10 || p.x > width + 10 || p.y < -10 || p.y > height + 10) continue;
       ctx.fillStyle = `rgba(255,255,255,${star.brightness})`;
       ctx.beginPath();
       ctx.arc(p.x, p.y, star.r, 0, Math.PI * 2);
       ctx.fill();
     }
+  }
+
+  /** The home star — a fixed landmark, visual only (no collision yet). Loosely Sirius-A-ish:
+   *  bright, warm, ordinary — the far star (not built yet) is meant to read as its opposite. */
+  private renderHomeStar(ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+    const p = toScreen(HOME_STAR_POS);
+    const r = HOME_STAR_RADIUS;
+
+    const gradient = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
+    gradient.addColorStop(0, "rgba(255,244,214,1)");
+    gradient.addColorStop(0.15, "rgba(255,224,150,0.9)");
+    gradient.addColorStop(0.4, "rgba(255,190,90,0.35)");
+    gradient.addColorStop(1, "rgba(255,170,60,0)");
+    ctx.fillStyle = gradient;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#fff7e0";
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r * 0.22, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  /** The belt's outer edge — "edge of normal operating range," visible but not a wall (nothing
+   *  physically stops travel past it). Dashed and faint since it's a huge unobtrusive backdrop
+   *  element most of the time, not a HUD-grade indicator. */
+  private renderBeltBoundary(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+    const p = toScreen(engine.hub.pos);
+    ctx.strokeStyle = "rgba(130,165,220,0.12)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([26, 20]);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, BELT_OUTER_RADIUS, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
   }
 
   /** The home hub as it appears out in the field — a plain placeholder ring for now (spec's
@@ -146,8 +187,13 @@ export class Renderer {
     }
   }
 
-  private renderAsteroid(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
-    const { asteroid } = engine;
+  private renderAsteroids(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+    for (const asteroid of engine.asteroids) {
+      this.renderOneAsteroid(asteroid, ctx, toScreen);
+    }
+  }
+
+  private renderOneAsteroid(asteroid: Asteroid, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
     const sweeping = !asteroid.scanned && asteroid.scanProgress > 0;
     const sweepRadius = asteroid.scanProgress * asteroid.outerRadius;
 
@@ -193,6 +239,15 @@ export class Renderer {
       if (cell.fractures && cell.boreProgress > 0) {
         this.renderCracks(ctx, toScreen, cell);
       }
+    }
+
+    if (sweeping) {
+      const c = toScreen(asteroid.center);
+      ctx.strokeStyle = "rgba(120,220,255,0.55)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, sweepRadius, 0, Math.PI * 2);
+      ctx.stroke();
     }
   }
 
@@ -252,9 +307,8 @@ export class Renderer {
     let label: string;
     if (hover.kind === "cell") {
       this.strokePolygon(ctx, toScreen, hover.cell.polygon, "#ffffff", 2);
-      label = engine.asteroid.scanned
-        ? COMPOSITION_INFO[hover.cell.composition].label
-        : "unidentified";
+      const owner = engine.asteroids.find((a) => a.cells.includes(hover.cell));
+      label = owner?.scanned ? COMPOSITION_INFO[hover.cell.composition].label : "unidentified";
     } else {
       // Chunks are small and already visually distinct (loose debris drifting on its own) —
       // an outline circle around them just added clutter. Tooltip only.
@@ -489,7 +543,8 @@ export class Renderer {
   }
 
   private renderHud(engine: Engine, ctx: CanvasRenderingContext2D, width: number, height: number) {
-    const { ship, asteroid } = engine;
+    const { ship } = engine;
+    const asteroid = engine.nearestAsteroid;
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
 
@@ -536,9 +591,9 @@ export class Renderer {
     ctx.fillText(`PING [Q]: ${pingText}`, panelX, y);
     y += lineH;
 
-    const surfaceDist = distance(ship.pos, asteroid.center) - asteroid.outerRadius;
-    const inScanRange = surfaceDist <= SCAN_RANGE;
-    if (!asteroid.scanned) {
+    if (asteroid && !asteroid.scanned) {
+      const surfaceDist = distance(ship.pos, asteroid.center) - asteroid.outerRadius;
+      const inScanRange = surfaceDist <= SCAN_RANGE;
       if (asteroid.scanProgress > 0) {
         bar("SCANNING", asteroid.scanProgress, "#7fe0ff", ` ${Math.round(asteroid.scanProgress * 100)}%`);
       } else if (inScanRange) {
@@ -549,10 +604,12 @@ export class Renderer {
       }
     }
 
-    if (ship.mode === "rcs" && engine.currentTarget) {
-      const info = COMPOSITION_INFO[engine.currentTarget.composition];
+    const target = engine.currentTarget;
+    if (ship.mode === "rcs" && target) {
+      const info = COMPOSITION_INFO[target.composition];
+      const targetScanned = engine.asteroids.some((a) => a.scanned && a.cells.includes(target));
       ctx.font = "12px monospace";
-      if (asteroid.scanned) {
+      if (targetScanned) {
         ctx.fillStyle = "#e8e8e8";
         ctx.fillText(`TARGET: ${info.label}   HARDNESS ${this.hardnessPips(info.hardness)}`, panelX, y);
       } else {
@@ -562,11 +619,11 @@ export class Renderer {
       y += lineH;
     }
 
-    if (asteroid.scanned && distance(ship.pos, asteroid.center) <= SCAN_DATA_DISPLAY_RANGE) {
+    if (asteroid && asteroid.scanned && distance(ship.pos, asteroid.center) <= SCAN_DATA_DISPLAY_RANGE) {
       y += 2;
       ctx.fillStyle = "#8f97a3";
       ctx.font = "11px monospace";
-      ctx.fillText("SCAN DATA — composition remaining in the main body", panelX, y);
+      ctx.fillText("SCAN DATA — composition remaining in the nearest body", panelX, y);
       y += 15;
       const compositions: Cell["composition"][] = ["ore", "crystal", "unstable"];
       for (const comp of compositions) {
@@ -614,49 +671,6 @@ export class Renderer {
       ctx.fillText(line, 16, y);
       y += 14;
     }
-  }
-
-  /** The hub screen — deliberately its own clean full-screen view rather than a panel over the
-   *  field, so docking reads as actually being somewhere else and safe, not just paused mid-air.
-   *  No shop/upgrades yet (see ARCHITECTURE.md) — just the materials tally and a way back out. */
-  private renderHubScene(engine: Engine, ctx: CanvasRenderingContext2D, width: number, height: number) {
-    const { hub } = engine;
-
-    ctx.fillStyle = "#050a12";
-    ctx.fillRect(0, 0, width, height);
-
-    ctx.textAlign = "center";
-    ctx.fillStyle = "#7de08d";
-    ctx.font = "bold 22px monospace";
-    ctx.fillText("HOME HUB", width / 2, height / 2 - 120);
-
-    ctx.font = "12px monospace";
-    ctx.fillStyle = "rgba(207,214,224,0.7)";
-    ctx.fillText("MATERIALS IN STORAGE", width / 2, height / 2 - 74);
-
-    const compositions: Cell["composition"][] = ["ore", "crystal", "unstable"];
-    let y = height / 2 - 40;
-    for (const comp of compositions) {
-      const info = COMPOSITION_INFO[comp];
-      ctx.font = "16px monospace";
-      ctx.fillStyle = info.color;
-      ctx.fillText(`${info.label}: ${hub.materials[comp]}`, width / 2, y);
-      y += 28;
-    }
-
-    ctx.font = "13px monospace";
-    ctx.fillStyle = "#9099a8";
-    ctx.fillText("[F] LAUNCH", width / 2, y + 26);
-
-    if (engine.message) {
-      ctx.font = "bold 15px monospace";
-      ctx.fillStyle = engine.message.color;
-      ctx.globalAlpha = Math.min(1, engine.message.timer);
-      ctx.fillText(engine.message.text, width / 2, 40);
-      ctx.globalAlpha = 1;
-    }
-
-    ctx.textAlign = "left";
   }
 
   private renderPauseOverlay(ctx: CanvasRenderingContext2D, width: number, height: number) {

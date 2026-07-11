@@ -107,11 +107,38 @@ export function cellWorldToLocal(cell: Cell, point: Vec2): LocalPoint {
   return { a: dot(rel, x), b: dot(rel, y) };
 }
 
-const pickComposition = (roll: number): Composition => {
-  if (roll < 0.45) return "ore";
-  if (roll < 0.75) return "crystal";
-  return "unstable";
-};
+const DEFAULT_COMPOSITION_WEIGHTS: Record<Composition, number> = { ore: 0.45, crystal: 0.3, unstable: 0.25 };
+
+/** Named composition profiles a belt can draw from so asteroids read as different "types," not
+ *  copies of the same rock with random paint — see Engine's belt scattering, which picks one
+ *  of these per asteroid. */
+export const ASTEROID_ARCHETYPES: Record<Composition, number>[] = [
+  { ore: 0.7, crystal: 0.2, unstable: 0.1 }, // ore-rich
+  { ore: 0.2, crystal: 0.7, unstable: 0.1 }, // crystal-rich
+  { ore: 0.25, crystal: 0.25, unstable: 0.5 }, // unstable-rich
+  DEFAULT_COMPOSITION_WEIGHTS, // balanced
+];
+
+/** Lets one asteroid skew ore-rich, another crystal-rich, etc. (see Engine's belt scattering) —
+ *  weights don't need to sum to 1, they're normalized here. */
+function makeCompositionPicker(weights: Record<Composition, number> = DEFAULT_COMPOSITION_WEIGHTS) {
+  const total = weights.ore + weights.crystal + weights.unstable;
+  return (roll: number): Composition => {
+    const r = roll * total;
+    if (r < weights.ore) return "ore";
+    if (r < weights.ore + weights.crystal) return "crystal";
+    return "unstable";
+  };
+}
+
+/** Bigger asteroids get proportionally more cells, but sublinearly — a large body should read
+ *  as more rock, not as finely subdivided rock (linear-with-area would make big asteroids
+ *  absurdly expensive to simulate). Calibrated so the original radius (190) reproduces the
+ *  original seed count (32). */
+function seedCountForRadius(radius: number): number {
+  const scaled = ASTEROID_SEED_COUNT * Math.sqrt(radius / ASTEROID_BASE_RADIUS);
+  return Math.round(Math.max(6, Math.min(60, scaled)));
+}
 
 function generateOutline(center: Vec2, baseRadius: number, rand: () => number): Polygon {
   const points = ASTEROID_OUTLINE_POINTS;
@@ -208,19 +235,28 @@ function computeNeighbors(cells: Cell[]): Map<number, number[]> {
 
 let nextCellId = 1;
 
+export interface AsteroidOptions {
+  radius?: number; // defaults to ASTEROID_BASE_RADIUS — the belt scatters a range of sizes
+  compositionWeights?: Record<Composition, number>; // lets one body skew ore-rich, another crystal-rich, etc.
+}
+
 export class Asteroid {
   center: Vec2;
-  outerRadius = ASTEROID_BASE_RADIUS; // approximate, used for range checks
+  outerRadius: number; // approximate, used for range checks
   outline: Polygon;
   cells: Cell[];
   neighbors: Map<number, number[]>;
   scanned = false;
   scanProgress = 0; // 0..1 — climbs while the ship holds a scan in range, decays otherwise
 
-  constructor(center: Vec2, rand: () => number = Math.random) {
+  constructor(center: Vec2, rand: () => number = Math.random, options: AsteroidOptions = {}) {
+    const radius = options.radius ?? ASTEROID_BASE_RADIUS;
+    const pickComposition = makeCompositionPicker(options.compositionWeights);
+
     this.center = center;
-    this.outline = generateOutline(center, ASTEROID_BASE_RADIUS, rand);
-    const seeds = scatterSeeds(center, this.outline, ASTEROID_SEED_COUNT, rand);
+    this.outerRadius = radius;
+    this.outline = generateOutline(center, radius, rand);
+    const seeds = scatterSeeds(center, this.outline, seedCountForRadius(radius), rand);
 
     this.cells = [];
     for (let i = 0; i < seeds.length; i++) {

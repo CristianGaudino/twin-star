@@ -1,5 +1,6 @@
 import { Composition } from "./asteroid";
 import { CargoHold } from "./ship";
+import { UpgradeId } from "./upgrades";
 import { Vec2 } from "./vec2";
 
 /**
@@ -12,6 +13,7 @@ import { Vec2 } from "./vec2";
 export class Hub {
   pos: Vec2;
   materials: CargoHold = { ore: 0, crystal: 0, unstable: 0 };
+  purchasedUpgrades = new Set<UpgradeId>();
 
   constructor(pos: Vec2) {
     this.pos = pos;

@@ -1,6 +1,6 @@
 import { InputState } from "./input";
 import { DamageSource, Ship } from "./ship";
-import { Asteroid, Cell, COMPOSITION_INFO, CrackSegment, cellWorldToLocal } from "./asteroid";
+import { ASTEROID_ARCHETYPES, Asteroid, Cell, COMPOSITION_INFO, CrackSegment, cellWorldToLocal } from "./asteroid";
 import { BodyHandle } from "./body";
 import { Chunk } from "./chunk";
 import { Contact, ContactMemory } from "./contacts";
@@ -8,6 +8,7 @@ import { Explosion } from "./explosion";
 import { HoverTarget } from "./hover";
 import { Hub } from "./hub";
 import { TOOLS, ToolId } from "./tools";
+import { UPGRADES, UpgradeId, canAfford } from "./upgrades";
 import {
   BoundaryHit,
   boundingRadius,
@@ -24,6 +25,10 @@ import {
 import { Material, RigidRef, applyFriction, applyPointImpulse, combineMaterials, resolveContact } from "./physics";
 import {
   ANGULAR_DAMPING,
+  ASTEROID_SIZE_CLASSES,
+  BELT_ASTEROID_COUNT,
+  BELT_INNER_RADIUS,
+  BELT_OUTER_RADIUS,
   BLAST_VISUAL_DURATION,
   CELL_TOUCH_EPSILON,
   CHARGE_BLAST_DAMAGE_MAX,
@@ -84,12 +89,6 @@ import {
   velocityAtPoint,
 } from "./vec2";
 
-interface Star {
-  pos: Vec2;
-  r: number;
-  brightness: number;
-}
-
 interface FlashMessage {
   text: string;
   timer: number;
@@ -107,7 +106,6 @@ interface DriftGroup {
   angularVelocity: number;
 }
 
-const WORLD_BOX = 1600; // half-extent of the starfield box around the origin
 const TOOL_ORDER: ToolId[] = ["laser", "drill", "charges"];
 const SPAWN_POS: Vec2 = v2(0, 0);
 let nextGroupId = 1;
@@ -120,11 +118,11 @@ const CHUNK_MATERIAL: Material = { restitution: CHUNK_RESTITUTION, friction: CHU
 
 export class Engine {
   ship: Ship;
-  asteroid: Asteroid;
+  asteroids: Asteroid[] = [];
   hub: Hub;
   chunks: Chunk[] = [];
   input: InputState;
-  stars: Star[] = [];
+  nearestAsteroid: Asteroid | null = null; // read by Renderer for scan-data HUD; updated every field frame
 
   paused = false;
   // "field" is everything that exists today; "hub" is a distinct, much simpler screen — see
@@ -160,17 +158,29 @@ export class Engine {
     this.input = new InputState(canvas);
     this.ship = new Ship(SPAWN_POS);
     this.hub = new Hub({ ...SPAWN_POS });
-    const asteroidAngle = Math.random() * Math.PI * 2;
-    const asteroidDist = 620;
-    this.asteroid = new Asteroid(fromAngle(asteroidAngle, asteroidDist));
+    this.asteroids = this.scatterBelt();
+  }
 
-    for (let i = 0; i < 260; i++) {
-      this.stars.push({
-        pos: v2((Math.random() * 2 - 1) * WORLD_BOX, (Math.random() * 2 - 1) * WORLD_BOX),
-        r: Math.random() < 0.15 ? 1.6 : 0.9,
-        brightness: 0.35 + Math.random() * 0.65,
-      });
+  /** Scatters the starting belt around the hub (the fixed landmark is the belt's own
+   *  inner/outer radius — see constants.ts; what's placed inside it is procedural content).
+   *  Biased toward the inner edge (`Math.random() ** 2`) rather than uniform across the
+   *  annulus, so the belt reads as denser near home with a sparser tail reaching all the way
+   *  out, instead of every asteroid being equally likely to spawn at the far edge. */
+  private scatterBelt(): Asteroid[] {
+    const asteroids: Asteroid[] = [];
+    for (let i = 0; i < BELT_ASTEROID_COUNT; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const t = Math.random() ** 2;
+      const dist = BELT_INNER_RADIUS + t * (BELT_OUTER_RADIUS - BELT_INNER_RADIUS);
+      const center = add(this.hub.pos, fromAngle(angle, dist));
+
+      const sizeClass = ASTEROID_SIZE_CLASSES[Math.floor(Math.random() * ASTEROID_SIZE_CLASSES.length)];
+      const radius = sizeClass.min + Math.random() * (sizeClass.max - sizeClass.min);
+      const compositionWeights = ASTEROID_ARCHETYPES[Math.floor(Math.random() * ASTEROID_ARCHETYPES.length)];
+
+      asteroids.push(new Asteroid(center, Math.random, { radius, compositionWeights }));
     }
+    return asteroids;
   }
 
   dispose() {
@@ -209,7 +219,7 @@ export class Engine {
       return;
     }
 
-    const { ship, asteroid } = this;
+    const { ship } = this;
 
     if (input.wasJustPressed(" ")) ship.toggleMode();
     if (input.wasJustPressed("tab")) this.cycleTool();
@@ -287,18 +297,22 @@ export class Engine {
       if (memory.age > CONTACT_FORGET_AFTER) this.discoveredContacts.delete(id);
     }
 
-    // --- scan: hold E in range while a wave sweeps outward from the asteroid ---
-    if (!asteroid.scanned) {
-      const surfaceDist = distance(ship.pos, asteroid.center) - asteroid.outerRadius;
+    // --- scan: hold E in range while a wave sweeps outward from the nearest asteroid ---
+    // With a whole belt instead of one rock, "the asteroid" becomes "whichever one you're
+    // actually near" — nearestAsteroid also drives the SCAN DATA HUD panel (see Renderer).
+    this.nearestAsteroid = this.findNearestAsteroid(ship.pos);
+    const scanTarget = this.nearestAsteroid;
+    if (scanTarget && !scanTarget.scanned) {
+      const surfaceDist = distance(ship.pos, scanTarget.center) - scanTarget.outerRadius;
       const canScan = surfaceDist <= SCAN_RANGE;
       if (canScan && input.isDown("e")) {
-        asteroid.scanProgress = Math.min(1, asteroid.scanProgress + dt / SCAN_HOLD_SECONDS);
-        if (asteroid.scanProgress >= 1) {
-          asteroid.scanned = true;
+        scanTarget.scanProgress = Math.min(1, scanTarget.scanProgress + dt / SCAN_HOLD_SECONDS);
+        if (scanTarget.scanProgress >= 1) {
+          scanTarget.scanned = true;
           this.setMessage("ASTEROID SCANNED — see SCAN DATA panel", "#7fe0ff");
         }
       } else {
-        asteroid.scanProgress = Math.max(0, asteroid.scanProgress - dt * SCAN_PROGRESS_DECAY);
+        scanTarget.scanProgress = Math.max(0, scanTarget.scanProgress - dt * SCAN_PROGRESS_DECAY);
       }
     }
 
@@ -407,42 +421,98 @@ export class Engine {
   /** The hub screen is deliberately much simpler than the field update — no physics, no
    *  mining, nothing at risk. Just launch back out when ready. */
   private updateHub(dt: number) {
-    if (this.input.wasJustPressed("f")) {
-      this.scene = "field";
-      this.setMessage("LAUNCHED", "#7fe0ff");
-    }
+    if (this.input.wasJustPressed("f")) this.launchFromHub();
     if (this.message) {
       this.message.timer -= dt;
       if (this.message.timer <= 0) this.message = null;
     }
   }
 
-  /** Checks a circular body (ship or chunk) against every intact cell — not just whichever
-   *  one its exact center lands inside, so a body can't slip through a gap narrower than
-   *  itself. Collision only ever considers a cell's *exposed* edges (see `exposedEdgeMask`) —
-   *  edges shared with another still-connected cell in the same group are internal seams, not
-   *  walls, since the two cells together form one continuous solid there. A cheap
-   *  bounding-radius pre-filter skips cells nowhere near `pos` before doing the real work. */
+  /** Public: the hub's DOM overlay (see HubOverlay.tsx) calls this directly from a button —
+   *  it isn't reachable through canvas input at all, so it needs its own entry point rather
+   *  than piggybacking on a keypress the way docking does. */
+  launchFromHub() {
+    if (this.scene !== "hub") return;
+    this.scene = "field";
+    this.setMessage("LAUNCHED", "#7fe0ff");
+  }
+
+  /** Public: called from the hub's DOM overlay. Spends materials exactly (no currency,
+   *  no partial refunds) and applies the upgrade's effect directly — see upgrades.ts for why
+   *  that's still hand-written rather than generic with only one upgrade to generalize from. */
+  purchaseUpgrade(id: UpgradeId): boolean {
+    if (this.scene !== "hub") return false;
+    const { hub, ship } = this;
+    if (hub.purchasedUpgrades.has(id)) return false;
+
+    const def = UPGRADES[id];
+    if (!canAfford(hub.materials, def.cost)) {
+      this.setMessage("NOT ENOUGH MATERIALS", "#ff8f6b");
+      return false;
+    }
+
+    hub.materials.ore -= def.cost.ore;
+    hub.materials.crystal -= def.cost.crystal;
+    hub.materials.unstable -= def.cost.unstable;
+    hub.purchasedUpgrades.add(id);
+    ship.cargoCapacity += def.cargoCapacityBonus;
+    this.setMessage(`PURCHASED — ${def.label}`, "#7de08d");
+    return true;
+  }
+
+  /** Classifies a world point into whichever asteroid's intact cell contains it, or null —
+   *  the multi-asteroid equivalent of the old single-`asteroid.cellAt`. */
+  private cellAt(worldPos: Vec2): Cell | null {
+    for (const asteroid of this.asteroids) {
+      const cell = asteroid.cellAt(worldPos);
+      if (cell) return cell;
+    }
+    return null;
+  }
+
+  private findNearestAsteroid(pos: Vec2): Asteroid | null {
+    let best: Asteroid | null = null;
+    let bestDist = Infinity;
+    for (const asteroid of this.asteroids) {
+      const d = distance(pos, asteroid.center);
+      if (d < bestDist) {
+        bestDist = d;
+        best = asteroid;
+      }
+    }
+    return best;
+  }
+
+  /** Checks a circular body (ship or chunk) against every intact cell across every asteroid —
+   *  not just whichever one its exact center lands inside, so a body can't slip through a gap
+   *  narrower than itself. Collision only ever considers a cell's *exposed* edges (see
+   *  `exposedEdgeMask`) — edges shared with another still-connected cell in the same group are
+   *  internal seams, not walls, since the two cells together form one continuous solid there.
+   *  A cheap bounding-radius pre-filter skips cells nowhere near `pos` before doing the real
+   *  work; belt-scale cell counts are small enough that no coarser per-asteroid filter is
+   *  needed (and a per-asteroid one would be unsafe anyway once cells have drifted). */
   private findCellContact(pos: Vec2, radius: number): { cell: Cell; boundary: BoundaryHit } | null {
     let bestCell: Cell | null = null;
     let bestBoundary: BoundaryHit | null = null;
     let bestPenetration = 0;
 
-    for (const cell of this.asteroid.cells) {
-      if (cell.fractured || cell.polygon.length < 3) continue;
-      const roughReach = boundingRadius(cell.polygon, cell.centroid) + radius;
-      if (distance(cell.centroid, pos) > roughReach) continue;
+    for (const asteroid of this.asteroids) {
+      for (const cell of asteroid.cells) {
+        if (cell.fractured || cell.polygon.length < 3) continue;
+        const roughReach = boundingRadius(cell.polygon, cell.centroid) + radius;
+        if (distance(cell.centroid, pos) > roughReach) continue;
 
-      const mask = this.exposedEdgeMask(cell);
-      const boundary = closestPointOnPolygon(cell.polygon, pos, (i) => mask[i]);
-      if (!boundary) continue; // cell has no exposed edges at all (fully buried) — nothing to hit
-      const inside = pointInPolygon(pos, cell.polygon);
-      const penetration = inside ? boundary.distance + radius : radius - boundary.distance;
-      if (penetration <= 0) continue;
-      if (penetration > bestPenetration) {
-        bestPenetration = penetration;
-        bestCell = cell;
-        bestBoundary = boundary;
+        const mask = this.exposedEdgeMask(cell);
+        const boundary = closestPointOnPolygon(cell.polygon, pos, (i) => mask[i]);
+        if (!boundary) continue; // cell has no exposed edges at all (fully buried) — nothing to hit
+        const inside = pointInPolygon(pos, cell.polygon);
+        const penetration = inside ? boundary.distance + radius : radius - boundary.distance;
+        if (penetration <= 0) continue;
+        if (penetration > bestPenetration) {
+          bestPenetration = penetration;
+          bestCell = cell;
+          bestBoundary = boundary;
+        }
       }
     }
     return bestCell && bestBoundary ? { cell: bestCell, boundary: bestBoundary } : null;
@@ -790,12 +860,20 @@ export class Engine {
     });
   }
 
-  /** Recomputes which clusters of intact cells are still connected to the main mass.
-   *  Once the body has been split, every resulting piece drifts — including
-   *  whatever remains of the original mass. A never-cut asteroid stays put. */
+  /** Recomputes which clusters of intact cells are still connected to their parent mass.
+   *  Once a body has been split, every resulting piece drifts — including whatever remains of
+   *  the original mass. A never-cut asteroid stays put. Cell adjacency is scoped per-asteroid
+   *  (each one's Voronoi tessellation is its own graph — cells from different asteroids are
+   *  never neighbors), but cell ids are globally unique across every asteroid, so their
+   *  adjacency maps merge into one without collisions and every asteroid's cells feed the same
+   *  flat list of drift groups. */
   private recomputeDriftGroups() {
-    const { asteroid } = this;
-    const intact = asteroid.cells.filter((c) => !c.fractured);
+    const intact: Cell[] = [];
+    const neighbors = new Map<number, number[]>();
+    for (const asteroid of this.asteroids) {
+      for (const cell of asteroid.cells) if (!cell.fractured) intact.push(cell);
+      for (const [id, list] of asteroid.neighbors) neighbors.set(id, list);
+    }
     if (intact.length === 0) {
       this.driftGroups = [];
       return;
@@ -815,7 +893,7 @@ export class Engine {
         const c = idToCell.get(id);
         if (!c) continue;
         comp.push(c);
-        for (const neighborId of asteroid.neighbors.get(id) ?? []) {
+        for (const neighborId of neighbors.get(id) ?? []) {
           if (visited.has(neighborId) || !idToCell.has(neighborId)) continue;
           const edgeKey = id < neighborId ? `${id}:${neighborId}` : `${neighborId}:${id}`;
           if (this.severedEdges.has(edgeKey)) continue;
@@ -916,12 +994,12 @@ export class Engine {
     );
     if (chunk) return { kind: "chunk", chunk };
 
-    const cell = this.asteroid.cellAt(worldMouse);
+    const cell = this.cellAt(worldMouse);
     return cell ? { kind: "cell", cell } : null;
   }
 
   private updateMining(dt: number, worldMouse: Vec2) {
-    const { ship, asteroid, input } = this;
+    const { ship, input } = this;
     this.currentTarget = null;
     if (ship.mode !== "rcs") {
       ship.anchored = false;
@@ -939,7 +1017,7 @@ export class Engine {
 
     const toolDef = TOOLS[ship.selectedTool];
     const inRange = distance(ship.pos, worldMouse) <= toolDef.range;
-    const cell = inRange ? asteroid.cellAt(worldMouse) : null;
+    const cell = inRange ? this.cellAt(worldMouse) : null;
     const validCell = cell && !cell.fractured ? cell : null;
     if (validCell) this.currentTarget = validCell;
 
@@ -960,9 +1038,21 @@ export class Engine {
     }
   }
 
+  /** "Away from the body" direction for a cell — used to fling freshly-cut/extracted debris
+   *  outward. Uses the cell's *current* drift group center of mass rather than the origin
+   *  asteroid's fixed center: a piece that's drifted a long way from where its parent asteroid
+   *  originally spawned should still eject away from where its own mass actually is now, not
+   *  away from a stale point. Also sidesteps needing per-cell "which asteroid did this come
+   *  from" bookkeeping now that there's more than one. */
+  private outwardDirection(cell: Cell): Vec2 {
+    const group = this.driftGroupOf(cell);
+    const center = group ? this.groupCenterOfMass(group.cells) : cell.centroid;
+    return normalize(sub(cell.centroid, center));
+  }
+
   /** Laser: shaves a sliver off the cell each completed cut, in place, until it's small enough to eject whole. */
   private cutCell(cell: Cell, dt: number) {
-    const { ship, asteroid } = this;
+    const { ship } = this;
     const info = COMPOSITION_INFO[cell.composition];
     const mult = info.recommendedTool === "laser" ? TOOL_RECOMMENDED_MULT : TOOL_OFF_MULT;
     cell.cutProgress += dt * mult;
@@ -976,7 +1066,7 @@ export class Engine {
     cell.piecesRemaining -= 1;
 
     const result = sliceNearPoint(cell.polygon, ship.pos, LASER_CUT_DEPTH);
-    const outDir = normalize(sub(cell.centroid, asteroid.center));
+    const outDir = this.outwardDirection(cell);
 
     if (!result || cell.piecesRemaining <= 0 || result.remainder.length < 3 || polygonArea(result.remainder) < MIN_CELL_AREA) {
       this.extractWholeCell(cell, 60 + Math.random() * 30);
@@ -1004,13 +1094,15 @@ export class Engine {
   private nearestDrillableCell(): { cell: Cell; boundary: BoundaryHit } | null {
     let best: { cell: Cell; boundary: BoundaryHit } | null = null;
     let bestDist = DRILL_ANCHOR_RANGE;
-    for (const cell of this.asteroid.cells) {
-      if (cell.fractured) continue;
-      const mask = this.exposedEdgeMask(cell);
-      const boundary = closestPointOnPolygon(cell.polygon, this.ship.pos, (i) => mask[i]);
-      if (!boundary || boundary.distance > bestDist) continue;
-      bestDist = boundary.distance;
-      best = { cell, boundary };
+    for (const asteroid of this.asteroids) {
+      for (const cell of asteroid.cells) {
+        if (cell.fractured) continue;
+        const mask = this.exposedEdgeMask(cell);
+        const boundary = closestPointOnPolygon(cell.polygon, this.ship.pos, (i) => mask[i]);
+        if (!boundary || boundary.distance > bestDist) continue;
+        bestDist = boundary.distance;
+        best = { cell, boundary };
+      }
     }
     return best;
   }
@@ -1150,8 +1242,8 @@ export class Engine {
   }
 
   private detonateCharges() {
-    const { asteroid, ship } = this;
-    const charged = asteroid.cells.filter((c) => c.hasCharge);
+    const { ship } = this;
+    const charged = this.asteroids.flatMap((asteroid) => asteroid.cells).filter((c) => c.hasCharge);
     if (charged.length === 0) {
       this.setMessage("NO CHARGES PLACED", "#ff8f6b");
       return;
@@ -1253,7 +1345,7 @@ export class Engine {
     const info = COMPOSITION_INFO[cell.composition];
     const value = info.chunkValue * Math.max(1, cell.piecesRemaining);
     const pos = cell.centroid;
-    const outDir = normalize(sub(pos, this.asteroid.center));
+    const outDir = this.outwardDirection(cell);
     cell.fractured = true;
     cell.hasCharge = false;
     this.spawnChunk(pos, cell.composition, value, scale(outDir, impulseSpeed));
