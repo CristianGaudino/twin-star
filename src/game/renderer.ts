@@ -2,7 +2,7 @@ import type { Engine } from "./engine";
 import { Cell, COMPOSITION_INFO } from "./asteroid";
 import { Chunk } from "./chunk";
 import { ContactMemory } from "./contacts";
-import { TOOLS } from "./tools";
+import { TOOLS, ToolId } from "./tools";
 import {
   BLAST_VISUAL_DURATION,
   CHARGE_BLAST_RADIUS,
@@ -257,15 +257,8 @@ export class Renderer {
     }
 
     const p = toScreen(worldMouse);
-    ctx.strokeStyle = valid ? "#7de08d" : "#888";
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
-    ctx.moveTo(p.x - 11, p.y);
-    ctx.lineTo(p.x + 11, p.y);
-    ctx.moveTo(p.x, p.y - 11);
-    ctx.lineTo(p.x, p.y + 11);
-    ctx.stroke();
+    const color = valid ? "#7de08d" : "#888";
+    this.renderToolCursor(ctx, p, ship.selectedTool, color);
 
     // cursor-side popup: material name only, nothing else
     if (engine.currentTarget) {
@@ -274,6 +267,43 @@ export class Renderer {
       ctx.textAlign = "left";
       ctx.fillStyle = "rgba(230,232,238,0.8)";
       ctx.fillText(label, p.x + 14, p.y - 12);
+    }
+  }
+
+  /** Each tool gets its own reticle shape, so what you're aiming with is obvious at a glance
+   *  without reading the HUD — laser keeps the plain crosshair, drill gets a bullseye (you're
+   *  boring straight into one spot), charges gets a diamond marker (you're placing an object). */
+  private renderToolCursor(ctx: CanvasRenderingContext2D, p: Vec2, tool: ToolId, color: string) {
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 1.5;
+
+    if (tool === "laser") {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+      ctx.moveTo(p.x - 11, p.y);
+      ctx.lineTo(p.x + 11, p.y);
+      ctx.moveTo(p.x, p.y - 11);
+      ctx.lineTo(p.x, p.y + 11);
+      ctx.stroke();
+    } else if (tool === "drill") {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 9, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y - 10);
+      ctx.lineTo(p.x + 10, p.y);
+      ctx.lineTo(p.x, p.y + 10);
+      ctx.lineTo(p.x - 10, p.y);
+      ctx.closePath();
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+      ctx.fill();
     }
   }
 

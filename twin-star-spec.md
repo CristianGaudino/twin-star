@@ -140,3 +140,5 @@ Validate the riskiest, most foundational unknown first, cheaply, before building
 
 - Different ships
 
+
+Lets look into mass and readjust both the size and mass of things, at the moment things that are bigger than the ship are very easily moved and push simply by bouncing into them. It just feels a little too arcadey, size and mass doesnt seem to really matter.

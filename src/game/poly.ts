@@ -158,27 +158,79 @@ export interface BoundaryHit {
   distance: number;
 }
 
-/** Closest point on the polygon boundary to `from`, with that edge's outward normal. */
-export function closestBoundaryPoint(poly: Polygon, from: Vec2): BoundaryHit | null {
-  if (poly.length < 2) return null;
+/** Closest point on the polygon boundary to `from`, considering only edges for which
+ * `edgeEnabled(index)` returns true (all edges, by default) — an edge index `i` runs from
+ * `poly[i]` to `poly[(i+1) % poly.length]`.
+ *
+ * Near a convex vertex, both adjacent edges can report that same vertex as their closest
+ * point at an equal distance — which edge "wins" the tie is essentially arbitrary (iteration
+ * order / floating-point noise), so naively using the winning edge's own perpendicular as the
+ * normal makes it flip discontinuously between the two edges' normals as a circle sweeps past
+ * the corner. That reads as snagging on nothing. When the closest point resolves to a vertex,
+ * this blends both adjacent edges' normals instead — but only if that neighboring edge is
+ * also enabled, so a disabled (e.g. internal-seam) edge never contributes to the blend. */
+export function closestPointOnPolygon(
+  poly: Polygon,
+  from: Vec2,
+  edgeEnabled: (index: number) => boolean = () => true,
+): BoundaryHit | null {
+  const n = poly.length;
+  if (n < 2) return null;
   const centroid = polygonCentroid(poly);
-  let best: BoundaryHit | null = null;
-  for (let i = 0; i < poly.length; i++) {
+
+  const edgeNormal = (i: number): Vec2 => {
     const a = poly[i];
-    const b = poly[(i + 1) % poly.length];
+    const b = poly[(i + 1) % n];
+    let normal = v2(b.y - a.y, -(b.x - a.x));
+    const len = length(normal);
+    normal = len > 1e-6 ? scale(normal, 1 / len) : v2(1, 0);
+    if (dot(normal, sub(a, centroid)) < 0) normal = scale(normal, -1);
+    return normal;
+  };
+
+  let bestIndex = -1;
+  let bestPoint = v2(0, 0);
+  let bestDist = Infinity;
+  let bestT = 0;
+
+  for (let i = 0; i < n; i++) {
+    if (!edgeEnabled(i)) continue;
+    const a = poly[i];
+    const b = poly[(i + 1) % n];
     const edge = sub(b, a);
     const edgeLenSq = edge.x * edge.x + edge.y * edge.y;
     let t = edgeLenSq > 1e-9 ? dot(sub(from, a), edge) / edgeLenSq : 0;
     t = Math.max(0, Math.min(1, t));
     const point = add(a, scale(edge, t));
     const d = length(sub(from, point));
-    if (!best || d < best.distance) {
-      let normal = v2(edge.y, -edge.x);
-      const normLen = length(normal);
-      normal = normLen > 1e-6 ? scale(normal, 1 / normLen) : v2(1, 0);
-      if (dot(normal, sub(point, centroid)) < 0) normal = scale(normal, -1);
-      best = { point, normal, distance: d };
+    if (d < bestDist) {
+      bestDist = d;
+      bestPoint = point;
+      bestIndex = i;
+      bestT = t;
     }
   }
-  return best;
+  if (bestIndex < 0) return null;
+
+  const prev = (bestIndex - 1 + n) % n;
+  const next = (bestIndex + 1) % n;
+  let normal: Vec2;
+  if (bestT <= 1e-6 && edgeEnabled(prev)) {
+    const blended = add(edgeNormal(bestIndex), edgeNormal(prev));
+    const len = length(blended);
+    normal = len > 1e-6 ? scale(blended, 1 / len) : edgeNormal(bestIndex);
+  } else if (bestT >= 1 - 1e-6 && edgeEnabled(next)) {
+    const blended = add(edgeNormal(bestIndex), edgeNormal(next));
+    const len = length(blended);
+    normal = len > 1e-6 ? scale(blended, 1 / len) : edgeNormal(bestIndex);
+  } else {
+    normal = edgeNormal(bestIndex);
+  }
+
+  return { point: bestPoint, normal, distance: bestDist };
+}
+
+/** Closest point across every edge of the polygon (see `closestPointOnPolygon`). */
+export function closestBoundaryPoint(poly: Polygon, from: Vec2): BoundaryHit | null {
+  return closestPointOnPolygon(poly, from);
 }

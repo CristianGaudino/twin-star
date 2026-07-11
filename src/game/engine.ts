@@ -8,6 +8,7 @@ import {
   BoundaryHit,
   boundingRadius,
   closestBoundaryPoint,
+  closestPointOnPolygon,
   pointInPolygon,
   polygonArea,
   polygonCentroid,
@@ -317,35 +318,68 @@ export class Engine {
     this.setMessage(lost > 0 ? `SHIP DESTROYED — ${lost} CARGO LOST` : "SHIP DESTROYED", "#ff5c5c");
   }
 
-  /** Checks a circular body (ship or chunk) against the asteroid. When the body's center is
-   *  cleanly inside a single cell (the common case — pressed against solid rock), resolves
-   *  against *that* cell only, so the contact normal stays stable while sliding along a
-   *  multi-cell surface instead of flickering between neighboring cells' slightly different
-   *  edge angles at every seam (which reads as snagging on nothing). Only when the center is
-   *  out in open space does it fall back to the nearest edge within `radius` of any cell —
-   *  that's the narrow-gap case, where a body could otherwise slip through a gap thinner than
-   *  itself because no single cell's point-in-polygon test ever notices it. */
+  /** Checks a circular body (ship or chunk) against every intact cell — not just whichever
+   *  one its exact center lands inside, so a body can't slip through a gap narrower than
+   *  itself. Collision only ever considers a cell's *exposed* edges (see `exposedEdgeMask`) —
+   *  edges shared with another still-connected cell in the same group are internal seams, not
+   *  walls, since the two cells together form one continuous solid there. A cheap
+   *  bounding-radius pre-filter skips cells nowhere near `pos` before doing the real work. */
   private findCellContact(pos: Vec2, radius: number): { cell: Cell; boundary: BoundaryHit } | null {
-    for (const cell of this.asteroid.cells) {
-      if (cell.fractured || cell.polygon.length < 3) continue;
-      if (!pointInPolygon(pos, cell.polygon)) continue;
-      const boundary = closestBoundaryPoint(cell.polygon, pos);
-      if (boundary) return { cell, boundary };
-    }
-
     let bestCell: Cell | null = null;
     let bestBoundary: BoundaryHit | null = null;
-    let bestDist = radius;
+    let bestPenetration = 0;
 
     for (const cell of this.asteroid.cells) {
       if (cell.fractured || cell.polygon.length < 3) continue;
-      const boundary = closestBoundaryPoint(cell.polygon, pos);
-      if (!boundary || boundary.distance >= bestDist) continue;
-      bestDist = boundary.distance;
-      bestCell = cell;
-      bestBoundary = boundary;
+      const roughReach = boundingRadius(cell.polygon, cell.centroid) + radius;
+      if (distance(cell.centroid, pos) > roughReach) continue;
+
+      const mask = this.exposedEdgeMask(cell);
+      const boundary = closestPointOnPolygon(cell.polygon, pos, (i) => mask[i]);
+      if (!boundary) continue; // cell has no exposed edges at all (fully buried) — nothing to hit
+      const inside = pointInPolygon(pos, cell.polygon);
+      const penetration = inside ? boundary.distance + radius : radius - boundary.distance;
+      if (penetration <= 0) continue;
+      if (penetration > bestPenetration) {
+        bestPenetration = penetration;
+        bestCell = cell;
+        bestBoundary = boundary;
+      }
     }
     return bestCell && bestBoundary ? { cell: bestCell, boundary: bestBoundary } : null;
+  }
+
+  /** Per-edge exposure: edge `i` (poly[i] -> poly[i+1]) counts as real, collidable rock only
+   *  if its *midpoint* isn't sitting inside (or right up against) another intact cell in the
+   *  same drift group. A midpoint is never at a shared vertex, so unlike testing an arbitrary
+   *  query point, this can't be fooled by a corner or a concave dip — it's always squarely in
+   *  the middle of one specific edge, where "is there more solid material right here" has an
+   *  unambiguous answer. */
+  private exposedEdgeMask(cell: Cell): boolean[] {
+    const group = this.driftGroupOf(cell);
+    const poly = cell.polygon;
+    const n = poly.length;
+    const mask = new Array<boolean>(n).fill(true);
+    if (!group) return mask;
+
+    for (let i = 0; i < n; i++) {
+      const a = poly[i];
+      const b = poly[(i + 1) % n];
+      const mid = v2((a.x + b.x) / 2, (a.y + b.y) / 2);
+      for (const other of group.cells) {
+        if (other === cell || other.fractured) continue;
+        if (pointInPolygon(mid, other.polygon)) {
+          mask[i] = false;
+          break;
+        }
+        const hit = closestBoundaryPoint(other.polygon, mid);
+        if (hit && hit.distance <= CELL_TOUCH_EPSILON) {
+          mask[i] = false;
+          break;
+        }
+      }
+    }
+    return mask;
   }
 
   /** Ship-vs-rock collision, resolved as a real rigid-body contact against the rock's actual
@@ -359,8 +393,12 @@ export class Engine {
     const { cell, boundary } = contact;
 
     // Close the overlap gradually rather than snapping straight to the surface —
-    // a hard teleport is what reads as a "jump" when the rock itself is moving.
-    const targetPos = add(boundary.point, scale(boundary.normal, SHIP_RADIUS * 0.6 + 0.5));
+    // a hard teleport is what reads as a "jump" when the rock itself is moving. The resting
+    // distance here MUST match the radius findCellContact uses to detect contact in the first
+    // place (SHIP_RADIUS) — a smaller "nestle in visually" offset here previously meant the
+    // ship could never actually reach a position collision considered fully resolved, so it
+    // stayed flagged as touching (and kept getting pulled back / re-impulsed) indefinitely.
+    const targetPos = add(boundary.point, scale(boundary.normal, SHIP_RADIUS + 0.5));
     const correctionFactor = Math.min(1, POSITION_CORRECTION_RATE * dt);
     ship.pos = add(ship.pos, scale(sub(targetPos, ship.pos), correctionFactor));
 
@@ -547,7 +585,9 @@ export class Engine {
       if (!contact) continue;
       const { boundary } = contact;
 
-      chunk.pos = add(boundary.point, scale(boundary.normal, chunk.radius * 0.6 + 0.5));
+      // Same fix as the ship: resting distance must match the radius findCellContact
+      // used to detect the contact, or the chunk can never fully clear "touching."
+      chunk.pos = add(boundary.point, scale(boundary.normal, chunk.radius + 0.5));
       const radial = dot(chunk.vel, boundary.normal);
       if (radial < 0) {
         chunk.vel = sub(chunk.vel, scale(boundary.normal, radial * 1.5));
