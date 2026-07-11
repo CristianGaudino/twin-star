@@ -1,11 +1,13 @@
 import type { Engine } from "./engine";
 import { Cell, COMPOSITION_INFO } from "./asteroid";
 import { Chunk } from "./chunk";
-import { Contact } from "./contacts";
+import { ContactMemory } from "./contacts";
 import { TOOLS } from "./tools";
 import {
   BLAST_VISUAL_DURATION,
   CHARGE_BLAST_RADIUS,
+  CONTACT_FADE_DURATION,
+  CONTACT_FORGET_AFTER,
   DRILL_ANCHOR_RANGE,
   PING_MAX_RADIUS,
   SCAN_DATA_DISPLAY_RANGE,
@@ -276,7 +278,9 @@ export class Renderer {
   }
 
   /** One blip per discovered, currently off-screen contact — not just a single fixed point,
-   *  so tracking a body doesn't fall apart the moment mining splits it into several pieces. */
+   *  so tracking a body doesn't fall apart the moment mining splits it into several pieces.
+   *  Each blip sits at its *last known* position (frozen when discovered/refreshed), not a
+   *  live position, and fades out as that memory goes stale. */
   private renderRadarIndicators(
     engine: Engine,
     ctx: CanvasRenderingContext2D,
@@ -284,9 +288,8 @@ export class Renderer {
     width: number,
     height: number,
   ) {
-    const contacts = engine.getContacts().filter((c) => engine.discoveredContactIds.has(c.id));
-    for (const contact of contacts) {
-      this.renderRadarIndicator(engine, ctx, offset, width, height, contact);
+    for (const memory of engine.discoveredContacts.values()) {
+      this.renderRadarIndicator(engine, ctx, offset, width, height, memory);
     }
   }
 
@@ -296,14 +299,19 @@ export class Renderer {
     offset: Vec2,
     width: number,
     height: number,
-    contact: Contact,
+    memory: ContactMemory,
   ) {
     const { ship } = engine;
+    const contact = memory.contact;
     const screenPos = sub(contact.pos, offset);
     const margin = 28;
     const onScreen =
       screenPos.x >= 0 && screenPos.x <= width && screenPos.y >= 0 && screenPos.y <= height;
     if (onScreen) return;
+
+    const staleFor = memory.age - (CONTACT_FORGET_AFTER - CONTACT_FADE_DURATION);
+    const alpha = staleFor <= 0 ? 1 : Math.max(0, 1 - staleFor / CONTACT_FADE_DURATION);
+    if (alpha <= 0) return;
 
     const center = v2(width / 2, height / 2);
     const dir = normalize(sub(screenPos, center));
@@ -317,7 +325,7 @@ export class Renderer {
     ctx.save();
     ctx.translate(pos.x, pos.y);
     ctx.rotate(Math.atan2(dir.y, dir.x));
-    ctx.fillStyle = "#7fe0ff";
+    ctx.fillStyle = `rgba(127,224,255,${alpha})`;
     ctx.beginPath();
     ctx.moveTo(8, 0);
     ctx.lineTo(-6, -6);
@@ -328,10 +336,10 @@ export class Renderer {
 
     // Rounded, not exact — a ping gives a bearing and a rough range, not a precise fix.
     const dist = Math.round(distance(ship.pos, contact.pos) / 10) * 10;
-    ctx.fillStyle = "#7fe0ff";
+    ctx.fillStyle = `rgba(127,224,255,${alpha})`;
     ctx.font = "11px monospace";
     ctx.textAlign = "center";
-    ctx.fillText(`~${dist}m`, pos.x, pos.y + (dir.y > 0 ? 18 : -12));
+    ctx.fillText(`${dist}m`, pos.x, pos.y + (dir.y > 0 ? 18 : -12));
   }
 
   private renderHud(engine: Engine, ctx: CanvasRenderingContext2D, width: number, height: number) {
@@ -379,9 +387,7 @@ export class Renderer {
     y += lineH;
 
     const pingText = engine.pingCooldown > 0 ? `cooling ${engine.pingCooldown.toFixed(1)}s` : "READY";
-    const contactCount = engine.discoveredContactIds.size;
-    const contactSuffix = contactCount > 0 ? `  ·  ${contactCount} contact${contactCount > 1 ? "s" : ""} tracked` : "";
-    ctx.fillText(`PING [Q]: ${pingText}${contactSuffix}`, panelX, y);
+    ctx.fillText(`PING [Q]: ${pingText}`, panelX, y);
     y += lineH;
 
     const surfaceDist = distance(ship.pos, asteroid.center) - asteroid.outerRadius;

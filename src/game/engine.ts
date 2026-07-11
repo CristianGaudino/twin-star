@@ -2,13 +2,14 @@ import { InputState } from "./input";
 import { Ship } from "./ship";
 import { Asteroid, Cell, COMPOSITION_INFO } from "./asteroid";
 import { Chunk } from "./chunk";
-import { Contact } from "./contacts";
+import { Contact, ContactMemory } from "./contacts";
 import { TOOLS, ToolId } from "./tools";
-import { boundingRadius, closestBoundaryPoint, polygonArea, polygonCentroid, sliceNearPoint } from "./poly";
+import { boundingRadius, closestBoundaryPoint, polygonArea, polygonCentroid, polygonMinDistance, sliceNearPoint } from "./poly";
 import { RigidRef, applyPointImpulse, resolveContact } from "./physics";
 import {
   ANGULAR_DAMPING,
   BLAST_VISUAL_DURATION,
+  CELL_TOUCH_EPSILON,
   CHARGE_BLAST_DAMAGE_MAX,
   CHARGE_BLAST_PUSH_MAX,
   CHARGE_BLAST_RADIUS,
@@ -17,9 +18,8 @@ import {
   CHARGE_SIG_PER_USE,
   CHUNK_COLLECT_RADIUS,
   CHUNK_SHIP_BUMP_RESTITUTION,
+  CONTACT_FORGET_AFTER,
   DRIFT_DAMPING,
-  DRIFT_KICK_MAX,
-  DRIFT_KICK_MIN,
   DRILL_ANCHOR_RANGE,
   DRILL_PROGRESS_DECAY,
   DRILL_SIG_PER_SEC,
@@ -39,7 +39,6 @@ import {
   SHIP_MASS,
   SHIP_RADIUS,
   SIGNATURE_DECAY_PER_SEC,
-  SPLIT_SPIN_MAX,
   TOOL_OFF_MULT,
   TOOL_RECOMMENDED_MULT,
   VISION_RADIUS,
@@ -102,7 +101,7 @@ export class Engine {
   pingActive = false;
   pingRadius = 0;
   pingCooldown = 0;
-  discoveredContactIds = new Set<string>(); // read by Renderer to know which contacts get a radar blip
+  discoveredContacts = new Map<string, ContactMemory>(); // read by Renderer for radar blips
 
   message: FlashMessage | null = null;
   private cargoFullMessageCooldown = 0;
@@ -181,6 +180,8 @@ export class Engine {
     // --- sensors: ping + passive close-range detection ---
     // Both sweep the *current* contact list, so a piece that's drifted away after a
     // split still gets found — nothing is hardcoded to "the one asteroid" anymore.
+    // What's "discovered" is a snapshot, not a live link: it ages and is eventually
+    // forgotten if nothing refreshes it, so radar reflects what you actually know.
     this.pingCooldown = Math.max(0, this.pingCooldown - dt);
     if (input.wasJustPressed("q") && this.pingCooldown <= 0) {
       this.pingActive = true;
@@ -188,15 +189,16 @@ export class Engine {
       this.pingCooldown = PING_COOLDOWN;
     }
     const contacts = this.getContacts();
+    for (const memory of this.discoveredContacts.values()) memory.age += dt;
+
     if (this.pingActive) {
       this.pingRadius += PING_SPEED * dt;
       let newlyDetected = 0;
       for (const contact of contacts) {
-        if (this.discoveredContactIds.has(contact.id)) continue;
         const surfaceDist = distance(ship.pos, contact.pos) - contact.radius;
         if (this.pingRadius >= surfaceDist) {
-          this.discoveredContactIds.add(contact.id);
-          newlyDetected++;
+          if (!this.discoveredContacts.has(contact.id)) newlyDetected++;
+          this.discoveredContacts.set(contact.id, { contact, age: 0 });
         }
       }
       if (newlyDetected > 0) {
@@ -209,8 +211,11 @@ export class Engine {
     }
     for (const contact of contacts) {
       if (distance(ship.pos, contact.pos) - contact.radius < VISION_RADIUS) {
-        this.discoveredContactIds.add(contact.id);
+        this.discoveredContacts.set(contact.id, { contact, age: 0 });
       }
+    }
+    for (const [id, memory] of this.discoveredContacts) {
+      if (memory.age > CONTACT_FORGET_AFTER) this.discoveredContacts.delete(id);
     }
 
     // --- scan: hold E in range while a wave sweeps outward from the asteroid ---
@@ -408,11 +413,13 @@ export class Engine {
     return Math.max(1, area * ROCK_MASS_PER_AREA);
   }
 
-  /** Mass-weighted center of mass — the pivot every group rotates and is pushed around. */
-  private groupCenterOfMass(group: DriftGroup): Vec2 {
+  /** Mass-weighted center of mass — the pivot every group rotates and is pushed around.
+   *  Takes a raw cell list (not a DriftGroup) so it can also be used for a candidate
+   *  component before it's been wrapped into a group, e.g. right after a split. */
+  private groupCenterOfMass(cells: Cell[]): Vec2 {
     let totalMass = 0;
     let acc = v2(0, 0);
-    for (const cell of group.cells) {
+    for (const cell of cells) {
       const m = polygonArea(cell.polygon) * ROCK_MASS_PER_AREA;
       acc = add(acc, scale(cell.centroid, m));
       totalMass += m;
@@ -434,7 +441,7 @@ export class Engine {
 
   private rigidRefForGroup(group: DriftGroup | undefined): RigidRef {
     if (!group) return { pos: v2(0, 0), vel: v2(0, 0), angVel: 0, invMass: 0, invInertia: 0 };
-    const com = this.groupCenterOfMass(group);
+    const com = this.groupCenterOfMass(group.cells);
     return {
       pos: com,
       vel: group.vel,
@@ -457,7 +464,7 @@ export class Engine {
    *  the same way once they exist, rather than ping/radar needing new special-case code. */
   getContacts(): Contact[] {
     return this.driftGroups.map((group) => {
-      const com = this.groupCenterOfMass(group);
+      const com = this.groupCenterOfMass(group.cells);
       return {
         id: `rock-${group.id}`,
         kind: "rock" as const,
@@ -516,7 +523,7 @@ export class Engine {
   /** Recomputes which clusters of intact cells are still connected to the main mass.
    *  Once the body has been split, every resulting piece drifts — including
    *  whatever remains of the original mass. A never-cut asteroid stays put. */
-  private recomputeDriftGroups(kickSource?: Vec2) {
+  private recomputeDriftGroups() {
     const { asteroid } = this;
     const intact = asteroid.cells.filter((c) => !c.fractured);
     if (intact.length === 0) {
@@ -540,6 +547,12 @@ export class Engine {
         comp.push(c);
         for (const neighborId of asteroid.neighbors.get(id) ?? []) {
           if (visited.has(neighborId) || !idToCell.has(neighborId)) continue;
+          const neighborCell = idToCell.get(neighborId)!;
+          // Cells that were adjacent in the original tessellation only stay
+          // connected while their *current* geometry still touches — a cell
+          // the laser has shaved thin no longer holds a piece together just
+          // because it hasn't been fully cut through yet.
+          if (polygonMinDistance(c.polygon, neighborCell.polygon) > CELL_TOUCH_EPSILON) continue;
           visited.add(neighborId);
           stack.push(neighborId);
         }
@@ -549,42 +562,56 @@ export class Engine {
 
     // Every component is its own body, always — including a still-whole
     // asteroid, which simply starts (and stays) at rest until something
-    // actually hits it. Only a genuinely new split gets a recoil kick + spin.
-    // `id` carries over from whichever previous group this one overlaps with,
-    // so ping discovery and radar tracking survive the split.
-    const isSplit = components.length > 1;
-    this.driftGroups = components.map((comp) => {
+    // actually hits it. `id` carries over from whichever previous group this
+    // one overlaps with, so ping discovery and radar tracking survive a split.
+    const previousGroups = this.driftGroups;
+    const isInitial = previousGroups.length === 0;
+
+    const matches = components.map((comp) => {
       const ids = new Set(comp.map((c) => c.id));
-      const prev = this.driftGroups.find((g) => g.cells.some((c) => ids.has(c.id)));
-      if (prev) return { id: prev.id, cells: comp, vel: prev.vel, angularVelocity: prev.angularVelocity };
-      return {
-        id: nextGroupId++,
-        cells: comp,
-        vel: isSplit ? this.driftKick(comp, kickSource) : v2(0, 0),
-        angularVelocity: isSplit ? this.spinKick() : 0,
-      };
+      const prev = previousGroups.find((g) => g.cells.some((c) => ids.has(c.id)));
+      return { comp, prev };
     });
-  }
 
-  private driftKick(comp: Cell[], sourcePos?: Vec2): Vec2 {
-    const avg = comp.reduce((acc, c) => add(acc, c.centroid), v2(0, 0));
-    const center = scale(avg, 1 / comp.length);
-    const origin = sourcePos ?? this.asteroid.center;
-    const dir = normalize(sub(center, origin));
-    const speed = DRIFT_KICK_MIN + Math.random() * (DRIFT_KICK_MAX - DRIFT_KICK_MIN);
-    return scale(dir, speed);
-  }
+    // If two-or-more of this frame's components trace back to the *same* previous
+    // group, that group just split this frame.
+    const claimCount = new Map<DriftGroup, number>();
+    for (const { prev } of matches) {
+      if (prev) claimCount.set(prev, (claimCount.get(prev) ?? 0) + 1);
+    }
 
-  /** A real fracture is never perfectly balanced — a fresh split gets a small random tumble. */
-  private spinKick(): number {
-    return (Math.random() - 0.5) * 2 * SPLIT_SPIN_MAX;
+    this.driftGroups = matches.map(({ comp, prev }) => {
+      if (isInitial) {
+        return { id: nextGroupId++, cells: comp, vel: v2(0, 0), angularVelocity: 0 };
+      }
+      const isFreshSplit = !prev || (claimCount.get(prev) ?? 0) > 1;
+      if (!isFreshSplit && prev) {
+        return { id: prev.id, cells: comp, vel: prev.vel, angularVelocity: prev.angularVelocity };
+      }
+      if (!prev) {
+        return { id: nextGroupId++, cells: comp, vel: v2(0, 0), angularVelocity: 0 };
+      }
+      // A genuine split: no force has acted on either resulting piece, so neither
+      // gets an invented kick. Each simply keeps the parent's angular velocity
+      // (spin rate is unaffected by where a body happens to separate) and inherits
+      // the real velocity its own center of mass already had — which, if the
+      // parent was rotating, is *not* the same as the parent's center-of-mass
+      // velocity. A rigid body's velocity at any offset point r from its center
+      // is v + ω×r; that's a genuine consequence of the parent's existing spin,
+      // not a fabricated push, and it's exactly why a spinning body's fragments
+      // really do separate on their own once free, while a body at rest doesn't.
+      const newCom = this.groupCenterOfMass(comp);
+      const parentCom = this.groupCenterOfMass(prev.cells);
+      const vel = velocityAtPoint(prev.vel, prev.angularVelocity, sub(newCom, parentCom));
+      return { id: nextGroupId++, cells: comp, vel, angularVelocity: prev.angularVelocity };
+    });
   }
 
   private updateDriftGroups(dt: number) {
     for (const group of this.driftGroups) {
       if (Math.abs(group.angularVelocity) < 1e-5 && length(group.vel) < 1e-5) continue;
 
-      const com = this.groupCenterOfMass(group);
+      const com = this.groupCenterOfMass(group.cells);
       const dAngle = group.angularVelocity * dt;
       const dPos = scale(group.vel, dt);
       for (const cell of group.cells) {
@@ -698,7 +725,7 @@ export class Engine {
       // tangential speed from rotation) rather than staying fixed in world space.
       const group = this.driftGroupOf(validTarget);
       if (group) {
-        const com = this.groupCenterOfMass(group);
+        const com = this.groupCenterOfMass(group.cells);
         const dAngle = group.angularVelocity * dt;
         ship.pos = add(rotateAround(ship.pos, com, dAngle), scale(group.vel, dt));
         const r = sub(ship.pos, com);
@@ -725,7 +752,7 @@ export class Engine {
       if (releasingFrom) {
         const group = this.driftGroupOf(releasingFrom);
         if (group) {
-          const com = this.groupCenterOfMass(group);
+          const com = this.groupCenterOfMass(group.cells);
           const r = sub(ship.pos, com);
           ship.vel = velocityAtPoint(group.vel, group.angularVelocity, r);
         }
@@ -769,11 +796,7 @@ export class Engine {
       this.extractWholeCell(cell, 210 + Math.random() * 60);
     }
 
-    const avgSource = scale(
-      blastPositions.reduce((acc, p) => add(acc, p), v2(0, 0)),
-      1 / blastPositions.length,
-    );
-    this.recomputeDriftGroups(avgSource);
+    this.recomputeDriftGroups();
 
     // Each blast pushes whichever resulting piece it actually ended up next
     // to — so if this detonation split the body in half, each half recoils

@@ -78,6 +78,42 @@ export function boundingRadius(poly: Polygon, centroid: Vec2): number {
   return r;
 }
 
+function pointSegmentDistance(p: Vec2, a: Vec2, b: Vec2): number {
+  const ab = sub(b, a);
+  const lenSq = ab.x * ab.x + ab.y * ab.y;
+  let t = lenSq > 1e-9 ? dot(sub(p, a), ab) / lenSq : 0;
+  t = Math.max(0, Math.min(1, t));
+  return length(sub(p, add(a, scale(ab, t))));
+}
+
+function segmentDistance(a1: Vec2, a2: Vec2, b1: Vec2, b2: Vec2): number {
+  return Math.min(
+    pointSegmentDistance(a1, b1, b2),
+    pointSegmentDistance(a2, b1, b2),
+    pointSegmentDistance(b1, a1, a2),
+    pointSegmentDistance(b2, a1, a2),
+  );
+}
+
+/** Minimum distance between two polygons' boundaries — 0 if they touch or overlap. Used to
+ *  tell whether two cells are *still* physically touching after one of them has been cut
+ *  down, rather than relying on a frozen "were they neighbors originally" graph. */
+export function polygonMinDistance(a: Polygon, b: Polygon): number {
+  let min = Infinity;
+  for (let i = 0; i < a.length; i++) {
+    const a1 = a[i];
+    const a2 = a[(i + 1) % a.length];
+    for (let j = 0; j < b.length; j++) {
+      const b1 = b[j];
+      const b2 = b[(j + 1) % b.length];
+      const d = segmentDistance(a1, a2, b1, b2);
+      if (d < min) min = d;
+      if (min <= 0) return 0;
+    }
+  }
+  return min;
+}
+
 export interface SliceResult {
   sliver: Polygon; // small piece nearest `from`, cut away
   remainder: Polygon; // the rest, staying behind

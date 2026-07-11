@@ -32,6 +32,9 @@ export const ASTEROID_BASE_RADIUS = 190;
 export const ASTEROID_OUTLINE_POINTS = 26;
 export const ASTEROID_SEED_COUNT = 32;
 export const MIN_CELL_AREA = 90; // px^2 — remainder below this ejects wholesale rather than slicing further
+// Two cells count as still touching if their boundaries are within this distance — checked
+// against current (possibly laser-shrunk) geometry, not just "were they neighbors originally."
+export const CELL_TOUCH_EPSILON = 2;
 
 // --- Sensors ---
 export const VISION_RADIUS = 300; // always-visible short range, no ping needed
@@ -39,6 +42,12 @@ export const SCAN_RANGE = 230;
 export const PING_COOLDOWN = 4.5; // seconds
 export const PING_SPEED = 900; // px/s expansion speed
 export const PING_MAX_RADIUS = 1600;
+
+// A ping/proximity contact is a last-known snapshot, not a live track — it goes stale and is
+// eventually forgotten if nothing refreshes it, so radar reflects what you actually know, not
+// the ground truth.
+export const CONTACT_FORGET_AFTER = 45; // seconds since last refresh before a contact is dropped
+export const CONTACT_FADE_DURATION = 8; // seconds — the blip fades out over this final stretch
 
 // Scan is a held action, not a tap: hold E in range and a wave sweeps outward
 // from the asteroid's center; leaving range or letting go decays progress.
@@ -99,9 +108,13 @@ export const CHUNK_SHIP_BUMP_RESTITUTION = 0.6; // uncollected chunks bounce off
 // starts at rest). Collisions and blasts push whichever body they actually
 // hit, off-center contacts induce spin, and two separate pieces now collide
 // with each other instead of passing through.
+//
+// Cutting a piece loose (laser/drill) applies zero extra impulse — nothing
+// has collided with it, so there's no force to fling it with. It simply keeps
+// whatever motion its parent already had, including the real tangential
+// velocity a piece picks up if the parent was spinning (conservation of
+// momentum, not a fudge). Only an actual force — a collision, or a charge's
+// blast impulse — changes a piece's velocity.
 export const DRIFT_DAMPING = 0.04; // per second — very light, so drift is slow and lasting
 export const ANGULAR_DAMPING = 0.06; // per second — spin settles a bit faster than translation
-export const DRIFT_KICK_MIN = 4; // px/s, extra nudge applied to a newly-split-off cluster
-export const DRIFT_KICK_MAX = 9;
-export const SPLIT_SPIN_MAX = 0.8; // rad/s — a fresh fracture rarely separates perfectly balanced
 export const ROCK_ROCK_RESTITUTION = 0.35; // duller than ship-rock — big dumb masses thudding together
