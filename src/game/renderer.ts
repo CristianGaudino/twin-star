@@ -1,6 +1,7 @@
 import type { Engine } from "./engine";
 import { Cell, COMPOSITION_INFO } from "./asteroid";
 import { Chunk } from "./chunk";
+import { Contact } from "./contacts";
 import { TOOLS } from "./tools";
 import {
   BLAST_VISUAL_DURATION,
@@ -67,7 +68,7 @@ export class Renderer {
     this.renderShip(engine, ctx, toScreen);
 
     if (ship.mode === "rcs") this.renderReticle(engine, ctx, toScreen);
-    if (asteroid.discovered) this.renderRadarIndicator(engine, ctx, offset, width, height);
+    this.renderRadarIndicators(engine, ctx, offset, width, height);
 
     this.renderHud(engine, ctx, width, height);
 
@@ -274,15 +275,31 @@ export class Renderer {
     }
   }
 
-  private renderRadarIndicator(
+  /** One blip per discovered, currently off-screen contact — not just a single fixed point,
+   *  so tracking a body doesn't fall apart the moment mining splits it into several pieces. */
+  private renderRadarIndicators(
     engine: Engine,
     ctx: CanvasRenderingContext2D,
     offset: Vec2,
     width: number,
     height: number,
   ) {
-    const { asteroid, ship } = engine;
-    const screenPos = sub(asteroid.center, offset);
+    const contacts = engine.getContacts().filter((c) => engine.discoveredContactIds.has(c.id));
+    for (const contact of contacts) {
+      this.renderRadarIndicator(engine, ctx, offset, width, height, contact);
+    }
+  }
+
+  private renderRadarIndicator(
+    engine: Engine,
+    ctx: CanvasRenderingContext2D,
+    offset: Vec2,
+    width: number,
+    height: number,
+    contact: Contact,
+  ) {
+    const { ship } = engine;
+    const screenPos = sub(contact.pos, offset);
     const margin = 28;
     const onScreen =
       screenPos.x >= 0 && screenPos.x <= width && screenPos.y >= 0 && screenPos.y <= height;
@@ -309,11 +326,12 @@ export class Renderer {
     ctx.fill();
     ctx.restore();
 
-    const dist = Math.round(distance(ship.pos, asteroid.center));
+    // Rounded, not exact — a ping gives a bearing and a rough range, not a precise fix.
+    const dist = Math.round(distance(ship.pos, contact.pos) / 10) * 10;
     ctx.fillStyle = "#7fe0ff";
     ctx.font = "11px monospace";
     ctx.textAlign = "center";
-    ctx.fillText(`${dist}m`, pos.x, pos.y + (dir.y > 0 ? 18 : -12));
+    ctx.fillText(`~${dist}m`, pos.x, pos.y + (dir.y > 0 ? 18 : -12));
   }
 
   private renderHud(engine: Engine, ctx: CanvasRenderingContext2D, width: number, height: number) {
@@ -361,7 +379,9 @@ export class Renderer {
     y += lineH;
 
     const pingText = engine.pingCooldown > 0 ? `cooling ${engine.pingCooldown.toFixed(1)}s` : "READY";
-    ctx.fillText(`PING [Q]: ${pingText}`, panelX, y);
+    const contactCount = engine.discoveredContactIds.size;
+    const contactSuffix = contactCount > 0 ? `  ·  ${contactCount} contact${contactCount > 1 ? "s" : ""} tracked` : "";
+    ctx.fillText(`PING [Q]: ${pingText}${contactSuffix}`, panelX, y);
     y += lineH;
 
     const surfaceDist = distance(ship.pos, asteroid.center) - asteroid.outerRadius;

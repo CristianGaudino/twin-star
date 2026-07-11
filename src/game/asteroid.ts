@@ -173,7 +173,6 @@ export class Asteroid {
   outline: Polygon;
   cells: Cell[];
   neighbors: Map<number, number[]>;
-  discovered = false;
   scanned = false;
   scanProgress = 0; // 0..1 — climbs while the ship holds a scan in range, decays otherwise
 

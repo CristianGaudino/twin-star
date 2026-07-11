@@ -2,6 +2,7 @@ import { InputState } from "./input";
 import { Ship } from "./ship";
 import { Asteroid, Cell, COMPOSITION_INFO } from "./asteroid";
 import { Chunk } from "./chunk";
+import { Contact } from "./contacts";
 import { TOOLS, ToolId } from "./tools";
 import { boundingRadius, closestBoundaryPoint, polygonArea, polygonCentroid, sliceNearPoint } from "./poly";
 import { RigidRef, applyPointImpulse, resolveContact } from "./physics";
@@ -74,8 +75,11 @@ interface FlashMessage {
 }
 
 /** A cluster of cells that mining has disconnected from the asteroid's main mass — a full 2D
- *  rigid body: linear velocity plus angular velocity about its own center of mass. */
+ *  rigid body: linear velocity plus angular velocity about its own center of mass. `id` is
+ *  stable across frames (carried over whenever recompute finds the same piece) so ping
+ *  discovery and radar tracking survive a split instead of resetting. */
 interface DriftGroup {
+  id: number;
   cells: Cell[];
   vel: Vec2;
   angularVelocity: number;
@@ -84,6 +88,7 @@ interface DriftGroup {
 const WORLD_BOX = 1600; // half-extent of the starfield box around the origin
 const TOOL_ORDER: ToolId[] = ["laser", "drill", "charges"];
 const SPAWN_POS: Vec2 = v2(0, 0);
+let nextGroupId = 1;
 
 export class Engine {
   ship: Ship;
@@ -97,6 +102,7 @@ export class Engine {
   pingActive = false;
   pingRadius = 0;
   pingCooldown = 0;
+  discoveredContactIds = new Set<string>(); // read by Renderer to know which contacts get a radar blip
 
   message: FlashMessage | null = null;
   private cargoFullMessageCooldown = 0;
@@ -172,24 +178,39 @@ export class Engine {
     ship.updateMovement(dt, input, worldMouse);
     this.resolveAsteroidCollision(dt);
 
-    // --- sensors: ping ---
+    // --- sensors: ping + passive close-range detection ---
+    // Both sweep the *current* contact list, so a piece that's drifted away after a
+    // split still gets found — nothing is hardcoded to "the one asteroid" anymore.
     this.pingCooldown = Math.max(0, this.pingCooldown - dt);
     if (input.wasJustPressed("q") && this.pingCooldown <= 0) {
       this.pingActive = true;
       this.pingRadius = 0;
       this.pingCooldown = PING_COOLDOWN;
     }
+    const contacts = this.getContacts();
     if (this.pingActive) {
       this.pingRadius += PING_SPEED * dt;
-      const distToAsteroid = distance(ship.pos, asteroid.center) - asteroid.outerRadius;
-      if (!asteroid.discovered && this.pingRadius >= distToAsteroid) {
-        asteroid.discovered = true;
-        this.setMessage("ASTEROID CONTACT DETECTED", "#7fe0ff");
+      let newlyDetected = 0;
+      for (const contact of contacts) {
+        if (this.discoveredContactIds.has(contact.id)) continue;
+        const surfaceDist = distance(ship.pos, contact.pos) - contact.radius;
+        if (this.pingRadius >= surfaceDist) {
+          this.discoveredContactIds.add(contact.id);
+          newlyDetected++;
+        }
+      }
+      if (newlyDetected > 0) {
+        this.setMessage(
+          newlyDetected > 1 ? `${newlyDetected} CONTACTS DETECTED` : "CONTACT DETECTED",
+          "#7fe0ff",
+        );
       }
       if (this.pingRadius > PING_MAX_RADIUS) this.pingActive = false;
     }
-    if (distance(ship.pos, asteroid.center) - asteroid.outerRadius < VISION_RADIUS) {
-      asteroid.discovered = true;
+    for (const contact of contacts) {
+      if (distance(ship.pos, contact.pos) - contact.radius < VISION_RADIUS) {
+        this.discoveredContactIds.add(contact.id);
+      }
     }
 
     // --- scan: hold E in range while a wave sweeps outward from the asteroid ---
@@ -423,6 +444,30 @@ export class Engine {
     };
   }
 
+  private groupBoundingRadius(group: DriftGroup, com: Vec2): number {
+    let maxR = 0;
+    for (const cell of group.cells) {
+      for (const v of cell.polygon) maxR = Math.max(maxR, distance(v, com));
+    }
+    return Math.max(10, maxR);
+  }
+
+  /** Every currently-trackable thing in the world, for ping/radar. Rock pieces are the only
+   *  kind today — other asteroids, ships, drones, enemies, and satellites should plug in here
+   *  the same way once they exist, rather than ping/radar needing new special-case code. */
+  getContacts(): Contact[] {
+    return this.driftGroups.map((group) => {
+      const com = this.groupCenterOfMass(group);
+      return {
+        id: `rock-${group.id}`,
+        kind: "rock" as const,
+        pos: com,
+        radius: this.groupBoundingRadius(group, com),
+        label: "Rock Mass",
+      };
+    });
+  }
+
   /** Keeps drifting/collected chunks from passing straight through solid rock. */
   private resolveChunkCollisions() {
     const { asteroid } = this;
@@ -505,12 +550,15 @@ export class Engine {
     // Every component is its own body, always — including a still-whole
     // asteroid, which simply starts (and stays) at rest until something
     // actually hits it. Only a genuinely new split gets a recoil kick + spin.
+    // `id` carries over from whichever previous group this one overlaps with,
+    // so ping discovery and radar tracking survive the split.
     const isSplit = components.length > 1;
     this.driftGroups = components.map((comp) => {
       const ids = new Set(comp.map((c) => c.id));
       const prev = this.driftGroups.find((g) => g.cells.some((c) => ids.has(c.id)));
-      if (prev) return { cells: comp, vel: prev.vel, angularVelocity: prev.angularVelocity };
+      if (prev) return { id: prev.id, cells: comp, vel: prev.vel, angularVelocity: prev.angularVelocity };
       return {
+        id: nextGroupId++,
         cells: comp,
         vel: isSplit ? this.driftKick(comp, kickSource) : v2(0, 0),
         angularVelocity: isSplit ? this.spinKick() : 0,
