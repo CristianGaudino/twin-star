@@ -936,43 +936,48 @@ export class Engine {
     const cellRadius = boundingRadius(cell.polygon, cell.centroid);
     const stepLen = cellRadius * 0.14;
     const maxGenerations = DRILL_FRACTURE_GENERATIONS;
+    const minSegments = 16;
+    const maxSeeds = 30;
 
     interface Walker {
       pos: Vec2;
       dir: number;
     }
-    let walkers: Walker[] = [];
-    const seedCount = 2 + Math.floor(Math.random() * 2);
-    for (let i = 0; i < seedCount; i++) {
-      walkers.push({ pos: origin, dir: Math.random() * Math.PI * 2 });
-    }
 
     const segments: CrackSegment[] = [];
-    for (let gen = 0; gen < maxGenerations && walkers.length > 0; gen++) {
-      const next: Walker[] = [];
-      for (const w of walkers) {
-        const dir = w.dir + (Math.random() - 0.5) * 1.2;
-        const candidate = add(w.pos, fromAngle(dir, stepLen * (0.6 + Math.random() * 0.8)));
-        const end = clampInsidePolygon(cell.polygon, w.pos, candidate);
-        segments.push({
-          a: cellWorldToLocal(cell, w.pos),
-          b: cellWorldToLocal(cell, end),
-          order: gen / maxGenerations,
-        });
+    let seeds = 0;
+    // A single seed can die out almost immediately in a small or thin cell — every step lands
+    // right back on the edge — which reads as barely any crack at all. Keep planting fresh
+    // hairlines from the origin until the network actually has enough segments to look like one.
+    while (segments.length < minSegments && seeds < maxSeeds) {
+      seeds++;
+      let walkers: Walker[] = [{ pos: origin, dir: Math.random() * Math.PI * 2 }];
+      for (let gen = 0; gen < maxGenerations && walkers.length > 0; gen++) {
+        const next: Walker[] = [];
+        for (const w of walkers) {
+          const dir = w.dir + (Math.random() - 0.5) * 1.2;
+          const candidate = add(w.pos, fromAngle(dir, stepLen * (0.6 + Math.random() * 0.8)));
+          const end = clampInsidePolygon(cell.polygon, w.pos, candidate);
+          segments.push({
+            a: cellWorldToLocal(cell, w.pos),
+            b: cellWorldToLocal(cell, end),
+            order: gen / maxGenerations,
+          });
 
-        const hitEdge = distance(end, candidate) > 1e-3;
-        if (hitEdge) continue; // this hairline reached the surface — stop growing it
+          const hitEdge = distance(end, candidate) > 1e-3;
+          if (hitEdge) continue; // this hairline reached the surface — stop growing it
 
-        const roll = Math.random();
-        if (roll < 0.2 && gen < maxGenerations - 1) {
-          next.push({ pos: end, dir: dir + 0.5 + Math.random() * 0.6 });
-          next.push({ pos: end, dir: dir - 0.5 - Math.random() * 0.6 });
-        } else if (roll < 0.9) {
-          next.push({ pos: end, dir });
+          const roll = Math.random();
+          if (roll < 0.2 && gen < maxGenerations - 1) {
+            next.push({ pos: end, dir: dir + 0.5 + Math.random() * 0.6 });
+            next.push({ pos: end, dir: dir - 0.5 - Math.random() * 0.6 });
+          } else if (roll < 0.9) {
+            next.push({ pos: end, dir });
+          }
+          // else: this hairline fizzles out here
         }
-        // else: this hairline fizzles out here
+        walkers = next;
       }
-      walkers = next;
     }
     cell.fractures = segments;
   }
