@@ -32,6 +32,29 @@ export function polygonCentroid(poly: Polygon): Vec2 {
   return v2(cx / (6 * area), cy / (6 * area));
 }
 
+/** Second moment of area (∫∫ r² dA) of a polygon about its own centroid, unit density.
+ *  Multiply by mass-per-area to get its actual contribution to rotational inertia. This is
+ *  the piece's own "spread of mass around its own middle" — treating a cell as a zero-size
+ *  point mass (as if all of it sat exactly at its centroid) ignores this entirely, which
+ *  makes small/compact pieces (a single cell especially) come out with almost no rotational
+ *  inertia at all — and with that, even a light off-center tap produces wildly excessive spin,
+ *  since angular response scales with 1/inertia. */
+export function polygonSecondMomentOfArea(poly: Polygon): number {
+  const c = polygonCentroid(poly);
+  let sum = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const p0 = poly[i];
+    const p1 = poly[(i + 1) % poly.length];
+    const x0 = p0.x - c.x;
+    const y0 = p0.y - c.y;
+    const x1 = p1.x - c.x;
+    const y1 = p1.y - c.y;
+    const cross = x0 * y1 - x1 * y0;
+    sum += cross * (x0 * x0 + x0 * x1 + x1 * x1 + y0 * y0 + y0 * y1 + y1 * y1);
+  }
+  return Math.abs(sum) / 12;
+}
+
 export function pointInPolygon(point: Vec2, poly: Polygon): boolean {
   let inside = false;
   for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {

@@ -4,7 +4,17 @@ import { Asteroid, Cell, COMPOSITION_INFO } from "./asteroid";
 import { Chunk } from "./chunk";
 import { Contact, ContactMemory } from "./contacts";
 import { TOOLS, ToolId } from "./tools";
-import { boundingRadius, closestBoundaryPoint, polygonArea, polygonCentroid, polygonMinDistance, sliceNearPoint } from "./poly";
+import {
+  BoundaryHit,
+  boundingRadius,
+  closestBoundaryPoint,
+  pointInPolygon,
+  polygonArea,
+  polygonCentroid,
+  polygonMinDistance,
+  polygonSecondMomentOfArea,
+  sliceNearPoint,
+} from "./poly";
 import { RigidRef, applyPointImpulse, resolveContact } from "./physics";
 import {
   ANGULAR_DAMPING,
@@ -31,6 +41,7 @@ import {
   PING_MAX_RADIUS,
   PING_SPEED,
   POSITION_CORRECTION_RATE,
+  ROCK_CONTACT_MIN_CLOSING_SPEED,
   ROCK_MASS_PER_AREA,
   ROCK_ROCK_RESTITUTION,
   SCAN_HOLD_SECONDS,
@@ -111,6 +122,11 @@ export class Engine {
   blastEffects: { pos: Vec2; timer: number }[] = []; // read by Renderer for the shockwave visual
   private anchoredCell: Cell | null = null;
   private driftGroups: DriftGroup[] = [];
+  // Once two originally-adjacent cells are geometrically confirmed to no longer touch, that
+  // connection is gone for good — material doesn't re-fuse just because geometry (e.g. from
+  // rotation) happens to bring it back within tolerance a frame later. Without this, a gap
+  // sitting near the touch threshold can flicker connected/disconnected forever.
+  private severedEdges = new Set<string>();
 
   private width = 0;
   private height = 0;
@@ -301,16 +317,46 @@ export class Engine {
     this.setMessage(lost > 0 ? `SHIP DESTROYED — ${lost} CARGO LOST` : "SHIP DESTROYED", "#ff5c5c");
   }
 
+  /** Checks a circular body (ship or chunk) against the asteroid. When the body's center is
+   *  cleanly inside a single cell (the common case — pressed against solid rock), resolves
+   *  against *that* cell only, so the contact normal stays stable while sliding along a
+   *  multi-cell surface instead of flickering between neighboring cells' slightly different
+   *  edge angles at every seam (which reads as snagging on nothing). Only when the center is
+   *  out in open space does it fall back to the nearest edge within `radius` of any cell —
+   *  that's the narrow-gap case, where a body could otherwise slip through a gap thinner than
+   *  itself because no single cell's point-in-polygon test ever notices it. */
+  private findCellContact(pos: Vec2, radius: number): { cell: Cell; boundary: BoundaryHit } | null {
+    for (const cell of this.asteroid.cells) {
+      if (cell.fractured || cell.polygon.length < 3) continue;
+      if (!pointInPolygon(pos, cell.polygon)) continue;
+      const boundary = closestBoundaryPoint(cell.polygon, pos);
+      if (boundary) return { cell, boundary };
+    }
+
+    let bestCell: Cell | null = null;
+    let bestBoundary: BoundaryHit | null = null;
+    let bestDist = radius;
+
+    for (const cell of this.asteroid.cells) {
+      if (cell.fractured || cell.polygon.length < 3) continue;
+      const boundary = closestBoundaryPoint(cell.polygon, pos);
+      if (!boundary || boundary.distance >= bestDist) continue;
+      bestDist = boundary.distance;
+      bestCell = cell;
+      bestBoundary = boundary;
+    }
+    return bestCell && bestBoundary ? { cell: bestCell, boundary: bestBoundary } : null;
+  }
+
   /** Ship-vs-rock collision, resolved as a real rigid-body contact against the rock's actual
    *  velocity *and spin* (not just its center velocity) — a moving or spinning piece properly
    *  shoves the ship instead of just snapping its position every frame. The ship itself never
    *  spins from a hit (its orientation is player/thruster-controlled, not tumbling debris). */
   private resolveAsteroidCollision(dt: number) {
-    const { ship, asteroid } = this;
-    const cell = asteroid.cellAt(ship.pos);
-    if (!cell || cell.fractured) return;
-    const boundary = closestBoundaryPoint(cell.polygon, ship.pos);
-    if (!boundary) return;
+    const { ship } = this;
+    const contact = this.findCellContact(ship.pos, SHIP_RADIUS);
+    if (!contact) return;
+    const { cell, boundary } = contact;
 
     // Close the overlap gradually rather than snapping straight to the surface —
     // a hard teleport is what reads as a "jump" when the rock itself is moving.
@@ -356,39 +402,53 @@ export class Engine {
   }
 
   private resolveGroupPair(groupA: DriftGroup, groupB: DriftGroup, dt: number) {
-    let bestOverlap = 0;
+    // Bounding circles are only a cheap pre-filter here — they're generous enough
+    // (they cover the whole irregular cell shape) to report "touching" well before
+    // the actual polygons are anywhere near each other, which was enough to trigger
+    // a bogus collision the moment a piece split off and was still merely adjacent.
+    // The real contact test is exact polygon-to-polygon distance.
+    let bestGap = Infinity;
     let bestA: Cell | null = null;
     let bestB: Cell | null = null;
-    let bestDist = 0;
 
     for (const cellA of groupA.cells) {
       const rA = boundingRadius(cellA.polygon, cellA.centroid);
       for (const cellB of groupB.cells) {
         const rB = boundingRadius(cellB.polygon, cellB.centroid);
-        const d = distance(cellA.centroid, cellB.centroid);
-        const overlap = rA + rB - d;
-        if (overlap > bestOverlap) {
-          bestOverlap = overlap;
+        const centroidDist = distance(cellA.centroid, cellB.centroid);
+        if (centroidDist - rA - rB > CELL_TOUCH_EPSILON) continue; // circles alone rule this out
+        const gap = polygonMinDistance(cellA.polygon, cellB.polygon);
+        if (gap < bestGap) {
+          bestGap = gap;
           bestA = cellA;
           bestB = cellB;
-          bestDist = d;
         }
       }
     }
-    if (!bestA || !bestB) return;
+    if (!bestA || !bestB || bestGap > CELL_TOUCH_EPSILON) return;
 
+    const bestDist = distance(bestA.centroid, bestB.centroid);
     const normal = bestDist > 1e-6 ? scale(sub(bestA.centroid, bestB.centroid), 1 / bestDist) : v2(1, 0);
     const contact = scale(add(bestA.centroid, bestB.centroid), 0.5);
 
     const bodyA = this.rigidRefForGroup(groupA);
     const bodyB = this.rigidRefForGroup(groupB);
-    const result = resolveContact(bodyA, bodyB, contact, normal, ROCK_ROCK_RESTITUTION);
-    groupA.vel = result.velA;
-    groupA.angularVelocity = result.angVelA;
-    groupB.vel = result.velB;
-    groupB.angularVelocity = result.angVelB;
 
-    const penetration = bestOverlap;
+    // Only actually apply an impulse if they're meaningfully closing — two pieces
+    // resting near-motionless against each other shouldn't get nudged every frame
+    // just because the nearest cell pair flickers between near-identical candidates.
+    const rA = sub(contact, bodyA.pos);
+    const rB = sub(contact, bodyB.pos);
+    const closingSpeed = -dot(sub(velocityAtPoint(bodyA.vel, bodyA.angVel, rA), velocityAtPoint(bodyB.vel, bodyB.angVel, rB)), normal);
+    if (closingSpeed > ROCK_CONTACT_MIN_CLOSING_SPEED) {
+      const result = resolveContact(bodyA, bodyB, contact, normal, ROCK_ROCK_RESTITUTION);
+      groupA.vel = result.velA;
+      groupA.angularVelocity = result.angVelA;
+      groupB.vel = result.velB;
+      groupB.angularVelocity = result.angVelB;
+    }
+
+    const penetration = Math.max(0, CELL_TOUCH_EPSILON - bestGap);
     if (penetration > 0) {
       const invA = bodyA.invMass;
       const invB = bodyB.invMass;
@@ -427,14 +487,19 @@ export class Engine {
     return totalMass > 1e-6 ? scale(acc, 1 / totalMass) : v2(0, 0);
   }
 
-  /** Moment of inertia about `com`, treating each cell as a point mass at its own centroid —
-   *  a reasonable discretization given cells are small relative to the whole body. */
+  /** Moment of inertia about `com` — each cell's own rotational inertia about its own
+   *  centroid (its actual size/shape, via the parallel axis theorem) plus its point-mass
+   *  contribution from being offset from the group's center. The point-mass term alone
+   *  is a fine approximation for a many-celled body, but degenerates badly for a small or
+   *  single-cell piece (a lone cell IS its own center of mass, so the offset term is ~0),
+   *  which is exactly the case that matters most right after something splits off. */
   private groupInertia(group: DriftGroup, com: Vec2): number {
     let inertia = 0;
     for (const cell of group.cells) {
       const m = polygonArea(cell.polygon) * ROCK_MASS_PER_AREA;
+      const ownInertia = polygonSecondMomentOfArea(cell.polygon) * ROCK_MASS_PER_AREA;
       const d = distance(cell.centroid, com);
-      inertia += m * d * d;
+      inertia += ownInertia + m * d * d;
     }
     return Math.max(1, inertia);
   }
@@ -477,12 +542,10 @@ export class Engine {
 
   /** Keeps drifting/collected chunks from passing straight through solid rock. */
   private resolveChunkCollisions() {
-    const { asteroid } = this;
     for (const chunk of this.chunks) {
-      const cell = asteroid.cellAt(chunk.pos);
-      if (!cell) continue;
-      const boundary = closestBoundaryPoint(cell.polygon, chunk.pos);
-      if (!boundary) continue;
+      const contact = this.findCellContact(chunk.pos, chunk.radius);
+      if (!contact) continue;
+      const { boundary } = contact;
 
       chunk.pos = add(boundary.point, scale(boundary.normal, chunk.radius * 0.6 + 0.5));
       const radial = dot(chunk.vel, boundary.normal);
@@ -547,12 +610,20 @@ export class Engine {
         comp.push(c);
         for (const neighborId of asteroid.neighbors.get(id) ?? []) {
           if (visited.has(neighborId) || !idToCell.has(neighborId)) continue;
+          const edgeKey = id < neighborId ? `${id}:${neighborId}` : `${neighborId}:${id}`;
+          if (this.severedEdges.has(edgeKey)) continue;
           const neighborCell = idToCell.get(neighborId)!;
           // Cells that were adjacent in the original tessellation only stay
           // connected while their *current* geometry still touches — a cell
           // the laser has shaved thin no longer holds a piece together just
-          // because it hasn't been fully cut through yet.
-          if (polygonMinDistance(c.polygon, neighborCell.polygon) > CELL_TOUCH_EPSILON) continue;
+          // because it hasn't been fully cut through yet. Once confirmed
+          // apart, remember it permanently instead of re-checking forever —
+          // otherwise a gap sitting near the threshold (e.g. while the piece
+          // is rotating) can flicker connected/disconnected every frame.
+          if (polygonMinDistance(c.polygon, neighborCell.polygon) > CELL_TOUCH_EPSILON) {
+            this.severedEdges.add(edgeKey);
+            continue;
+          }
           visited.add(neighborId);
           stack.push(neighborId);
         }

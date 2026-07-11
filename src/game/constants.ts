@@ -118,3 +118,8 @@ export const CHUNK_SHIP_BUMP_RESTITUTION = 0.6; // uncollected chunks bounce off
 export const DRIFT_DAMPING = 0.04; // per second — very light, so drift is slow and lasting
 export const ANGULAR_DAMPING = 0.06; // per second — spin settles a bit faster than translation
 export const ROCK_ROCK_RESTITUTION = 0.35; // duller than ship-rock — big dumb masses thudding together
+// With several cells per group near each other, the single "closest pair" used for the contact
+// point can jump between different cell pairs from one frame to the next as things settle —
+// each jump nudges the contact normal, and without a floor that noise can needle in tiny,
+// inconsistently-directed impulses forever. Below this closing speed, treat it as at rest.
+export const ROCK_CONTACT_MIN_CLOSING_SPEED = 3; // px/s
