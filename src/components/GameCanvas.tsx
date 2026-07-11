@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { Engine } from "@/game/engine";
+import { Renderer } from "@/game/renderer";
 
 export default function GameCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -13,6 +14,7 @@ export default function GameCanvas() {
     if (!ctx) return;
 
     const engine = new Engine(canvas);
+    const renderer = new Renderer();
     let raf = 0;
     let last = performance.now();
 
@@ -34,7 +36,7 @@ export default function GameCanvas() {
       const dt = (now - last) / 1000;
       last = now;
       engine.update(dt);
-      engine.render(ctx, window.innerWidth, window.innerHeight);
+      renderer.render(engine, ctx, window.innerWidth, window.innerHeight);
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);

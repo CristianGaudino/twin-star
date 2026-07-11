@@ -1,0 +1,459 @@
+import type { Engine } from "./engine";
+import { Cell, COMPOSITION_INFO } from "./asteroid";
+import { Chunk } from "./chunk";
+import { TOOLS } from "./tools";
+import {
+  BLAST_VISUAL_DURATION,
+  CHARGE_BLAST_RADIUS,
+  DRILL_ANCHOR_RANGE,
+  PING_MAX_RADIUS,
+  SCAN_DATA_DISPLAY_RANGE,
+  SCAN_RANGE,
+  SHIP_RADIUS,
+} from "./constants";
+import { Vec2, add, distance, normalize, scale, sub, v2 } from "./vec2";
+
+/**
+ * Draws one frame from Engine's current state. Deliberately stateless and separate from Engine
+ * itself — Engine owns simulation (physics, mining, input), Renderer only reads it and draws.
+ * Split out ahead of enemies/combat landing so world-object rendering (ship, asteroid, chunks,
+ * and soon enemies) has one obvious place to grow instead of piling onto the simulation class.
+ */
+export class Renderer {
+  render(engine: Engine, ctx: CanvasRenderingContext2D, width: number, height: number) {
+    const { ship, asteroid } = engine;
+    const offset = sub(ship.pos, v2(width / 2, height / 2));
+    const toScreen = (p: Vec2): Vec2 => sub(p, offset);
+
+    ctx.fillStyle = "#04050a";
+    ctx.fillRect(0, 0, width, height);
+
+    this.renderStars(engine, ctx, toScreen, width, height);
+
+    if (engine.pingActive) {
+      const p = toScreen(ship.pos);
+      const alpha = Math.max(0, 1 - engine.pingRadius / PING_MAX_RADIUS);
+      ctx.strokeStyle = `rgba(120,220,255,${alpha * 0.6})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, engine.pingRadius, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    this.renderAsteroid(engine, ctx, toScreen);
+    if (!asteroid.scanned && asteroid.scanProgress > 0) {
+      const c = toScreen(asteroid.center);
+      const r = asteroid.scanProgress * asteroid.outerRadius;
+      ctx.strokeStyle = "rgba(120,220,255,0.55)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    for (const chunk of engine.chunks) this.renderChunk(ctx, toScreen, chunk);
+    this.renderBlastEffects(engine, ctx, toScreen);
+
+    if (engine.activeBeam) {
+      const from = toScreen(engine.activeBeam.from);
+      const to = toScreen(engine.activeBeam.to);
+      ctx.strokeStyle = engine.activeBeam.tool === "drill" ? "#ffb35c" : "#ff5c7a";
+      ctx.lineWidth = engine.activeBeam.tool === "drill" ? 3 : 1.6;
+      ctx.beginPath();
+      ctx.moveTo(from.x, from.y);
+      ctx.lineTo(to.x, to.y);
+      ctx.stroke();
+    }
+
+    this.renderShip(engine, ctx, toScreen);
+
+    if (ship.mode === "rcs") this.renderReticle(engine, ctx, toScreen);
+    if (asteroid.discovered) this.renderRadarIndicator(engine, ctx, offset, width, height);
+
+    this.renderHud(engine, ctx, width, height);
+
+    if (engine.paused) this.renderPauseOverlay(ctx, width, height);
+  }
+
+  private renderStars(
+    engine: Engine,
+    ctx: CanvasRenderingContext2D,
+    toScreen: (p: Vec2) => Vec2,
+    width: number,
+    height: number,
+  ) {
+    for (const star of engine.stars) {
+      const p = toScreen(star.pos);
+      if (p.x < -10 || p.x > width + 10 || p.y < -10 || p.y > height + 10) continue;
+      ctx.fillStyle = `rgba(255,255,255,${star.brightness})`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, star.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  private renderAsteroid(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+    const { asteroid } = engine;
+    const target = engine.currentTarget;
+    const sweeping = !asteroid.scanned && asteroid.scanProgress > 0;
+    const sweepRadius = asteroid.scanProgress * asteroid.outerRadius;
+
+    for (const cell of asteroid.cells) {
+      if (cell.fractured) continue;
+      const poly = cell.polygon;
+      if (poly.length < 3) continue;
+
+      ctx.beginPath();
+      const p0 = toScreen(poly[0]);
+      ctx.moveTo(p0.x, p0.y);
+      for (let i = 1; i < poly.length; i++) {
+        const p = toScreen(poly[i]);
+        ctx.lineTo(p.x, p.y);
+      }
+      ctx.closePath();
+
+      const isTarget = target === cell;
+      ctx.fillStyle = cell.shade;
+      ctx.globalAlpha = 0.88;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = "rgba(10,10,14,0.55)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      if (sweeping && distance(cell.centroid, asteroid.center) <= sweepRadius) {
+        ctx.fillStyle = "rgba(120,220,255,0.32)";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(160,230,255,0.85)";
+        ctx.lineWidth = 1.4;
+        ctx.stroke();
+      }
+
+      if (isTarget) {
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      const centroid = toScreen(cell.centroid);
+
+      if (cell.hasCharge) {
+        ctx.fillStyle = "#ff4444";
+        ctx.beginPath();
+        ctx.arc(centroid.x, centroid.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      if (cell.boreProgress > 0) {
+        ctx.strokeStyle = "#ffb35c";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(centroid.x, centroid.y, 10, -Math.PI / 2, -Math.PI / 2 + cell.boreProgress * Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+  }
+
+  private renderChunk(ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2, chunk: Chunk) {
+    const p = toScreen(chunk.pos);
+    const info = COMPOSITION_INFO[chunk.composition];
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(chunk.angle);
+    ctx.fillStyle = info.color;
+    ctx.strokeStyle = "rgba(0,0,0,0.4)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(chunk.shape[0].x, chunk.shape[0].y);
+    for (let i = 1; i < chunk.shape.length; i++) ctx.lineTo(chunk.shape[i].x, chunk.shape[i].y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  private renderBlastEffects(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+    for (const blast of engine.blastEffects) {
+      const progress = 1 - blast.timer / BLAST_VISUAL_DURATION;
+      const p = toScreen(blast.pos);
+
+      const ringRadius = progress * CHARGE_BLAST_RADIUS * 1.3;
+      const ringAlpha = Math.max(0, 1 - progress) * 0.8;
+      ctx.strokeStyle = `rgba(255,180,90,${ringAlpha})`;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, ringRadius, 0, Math.PI * 2);
+      ctx.stroke();
+
+      const flashAlpha = Math.max(0, 1 - progress * 4) * 0.9;
+      if (flashAlpha > 0) {
+        ctx.fillStyle = `rgba(255,230,180,${flashAlpha})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, Math.max(2, 22 * (1 - progress * 3)), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  private renderShip(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+    const { ship, input } = engine;
+    const p = toScreen(ship.pos);
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(ship.angle);
+
+    const thrusting =
+      !ship.anchored &&
+      (input.isDown("w") || input.isDown("a") || input.isDown("s") || input.isDown("d"));
+    if (thrusting) {
+      ctx.fillStyle = `rgba(255,${140 + Math.floor(Math.random() * 60)},60,0.9)`;
+      ctx.beginPath();
+      ctx.moveTo(-SHIP_RADIUS * 1.1, -3);
+      ctx.lineTo(-SHIP_RADIUS * 1.1 - 6 - Math.random() * 6, 0);
+      ctx.lineTo(-SHIP_RADIUS * 1.1, 3);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    ctx.fillStyle = ship.anchored ? "#ff9f4d" : ship.mode === "rcs" ? "#ffd166" : "#7fe0ff";
+    ctx.beginPath();
+    ctx.moveTo(SHIP_RADIUS * 1.4, 0);
+    ctx.lineTo(-SHIP_RADIUS, SHIP_RADIUS * 0.9);
+    ctx.lineTo(-SHIP_RADIUS * 0.5, 0);
+    ctx.lineTo(-SHIP_RADIUS, -SHIP_RADIUS * 0.9);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    if (ship.anchored) {
+      ctx.strokeStyle = "rgba(255,159,77,0.5)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, SHIP_RADIUS * 1.8, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  private renderReticle(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+    const { ship, input, asteroid } = engine;
+    const worldMouse = engine.screenToWorld(input.mouseScreen);
+    const toolDef = TOOLS[ship.selectedTool];
+    const valid = !!engine.currentTarget;
+
+    const shipScreen = toScreen(ship.pos);
+    ctx.strokeStyle = "rgba(255,255,255,0.15)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(shipScreen.x, shipScreen.y, toolDef.range, 0, Math.PI * 2);
+    ctx.stroke();
+
+    if (ship.selectedTool === "drill") {
+      ctx.strokeStyle = "rgba(255,179,92,0.35)";
+      ctx.beginPath();
+      ctx.arc(shipScreen.x, shipScreen.y, DRILL_ANCHOR_RANGE, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    const p = toScreen(worldMouse);
+    ctx.strokeStyle = valid ? "#7de08d" : "#888";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+    ctx.moveTo(p.x - 11, p.y);
+    ctx.lineTo(p.x + 11, p.y);
+    ctx.moveTo(p.x, p.y - 11);
+    ctx.lineTo(p.x, p.y + 11);
+    ctx.stroke();
+
+    // cursor-side popup: material name only, nothing else
+    if (engine.currentTarget) {
+      const label = asteroid.scanned ? COMPOSITION_INFO[engine.currentTarget.composition].label : "unidentified";
+      ctx.font = "11px monospace";
+      ctx.textAlign = "left";
+      ctx.fillStyle = "rgba(230,232,238,0.8)";
+      ctx.fillText(label, p.x + 14, p.y - 12);
+    }
+  }
+
+  private renderRadarIndicator(
+    engine: Engine,
+    ctx: CanvasRenderingContext2D,
+    offset: Vec2,
+    width: number,
+    height: number,
+  ) {
+    const { asteroid, ship } = engine;
+    const screenPos = sub(asteroid.center, offset);
+    const margin = 28;
+    const onScreen =
+      screenPos.x >= 0 && screenPos.x <= width && screenPos.y >= 0 && screenPos.y <= height;
+    if (onScreen) return;
+
+    const center = v2(width / 2, height / 2);
+    const dir = normalize(sub(screenPos, center));
+    const maxX = width / 2 - margin;
+    const maxY = height / 2 - margin;
+    const tX = dir.x !== 0 ? maxX / Math.abs(dir.x) : Infinity;
+    const tY = dir.y !== 0 ? maxY / Math.abs(dir.y) : Infinity;
+    const t = Math.min(tX, tY);
+    const pos = add(center, scale(dir, t));
+
+    ctx.save();
+    ctx.translate(pos.x, pos.y);
+    ctx.rotate(Math.atan2(dir.y, dir.x));
+    ctx.fillStyle = "#7fe0ff";
+    ctx.beginPath();
+    ctx.moveTo(8, 0);
+    ctx.lineTo(-6, -6);
+    ctx.lineTo(-6, 6);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    const dist = Math.round(distance(ship.pos, asteroid.center));
+    ctx.fillStyle = "#7fe0ff";
+    ctx.font = "11px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(`${dist}m`, pos.x, pos.y + (dir.y > 0 ? 18 : -12));
+  }
+
+  private renderHud(engine: Engine, ctx: CanvasRenderingContext2D, width: number, height: number) {
+    const { ship, asteroid } = engine;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+
+    const panelX = 16;
+    let y = 16;
+    const lineH = 18;
+
+    const bar = (label: string, frac: number, color: string, extra = "") => {
+      ctx.font = "12px monospace";
+      ctx.fillStyle = "#cfd6e0";
+      ctx.fillText(`${label}${extra}`, panelX, y);
+      const barX = panelX + 92;
+      const barW = 130;
+      ctx.fillStyle = "rgba(255,255,255,0.12)";
+      ctx.fillRect(barX, y + 2, barW, 10);
+      ctx.fillStyle = color;
+      ctx.fillRect(barX, y + 2, barW * Math.max(0, Math.min(1, frac)), 10);
+      y += lineH;
+    };
+
+    ctx.font = "13px monospace";
+    ctx.fillStyle = ship.anchored ? "#ff9f4d" : ship.mode === "rcs" ? "#ffd166" : "#7fe0ff";
+    const modeSuffix = ship.anchored
+      ? " (ANCHORED — drilling)"
+      : ship.mode === "cruise"
+        ? " (aim: mouse)"
+        : " (mining-ready)";
+    ctx.fillText(`MODE: ${ship.mode.toUpperCase()}${modeSuffix}`, panelX, y);
+    y += lineH + 2;
+
+    bar("HULL", ship.hull / 100, ship.hull > 30 ? "#7de08d" : "#ff6b6b", ` ${ship.hull.toFixed(0)}/100`);
+    bar("CARGO", ship.cargoUsed / ship.cargoCapacity, "#7fe0ff", ` ${ship.cargoUsed}/${ship.cargoCapacity}`);
+    bar("SIGNATURE", ship.signature / 100, "#ffa25c", ` ${ship.signature.toFixed(0)}%`);
+
+    y += 4;
+    ctx.font = "12px monospace";
+    ctx.fillStyle = "#cfd6e0";
+    const toolDef = TOOLS[ship.selectedTool];
+    const chargeInfo = ship.selectedTool === "charges" ? ` (${ship.chargesCarried} carried)` : "";
+    ctx.fillText(`TOOL: ${toolDef.label}${chargeInfo}  [TAB cycle, or 1 Laser / 2 Drill / 3 Charges]`, panelX, y);
+    y += lineH;
+
+    const pingText = engine.pingCooldown > 0 ? `cooling ${engine.pingCooldown.toFixed(1)}s` : "READY";
+    ctx.fillText(`PING [Q]: ${pingText}`, panelX, y);
+    y += lineH;
+
+    const surfaceDist = distance(ship.pos, asteroid.center) - asteroid.outerRadius;
+    const inScanRange = surfaceDist <= SCAN_RANGE;
+    if (!asteroid.scanned) {
+      if (asteroid.scanProgress > 0) {
+        bar("SCANNING", asteroid.scanProgress, "#7fe0ff", ` ${Math.round(asteroid.scanProgress * 100)}%`);
+      } else if (inScanRange) {
+        ctx.fillStyle = "#7de08d";
+        ctx.font = "12px monospace";
+        ctx.fillText("[HOLD E] SCAN ASTEROID", panelX, y);
+        y += lineH;
+      }
+    }
+
+    if (ship.mode === "rcs" && engine.currentTarget) {
+      const info = COMPOSITION_INFO[engine.currentTarget.composition];
+      ctx.font = "12px monospace";
+      if (asteroid.scanned) {
+        ctx.fillStyle = "#e8e8e8";
+        ctx.fillText(`TARGET: ${info.label}   HARDNESS ${this.hardnessPips(info.hardness)}`, panelX, y);
+      } else {
+        ctx.fillStyle = "#9099a8";
+        ctx.fillText("TARGET: unidentified — scan to reveal", panelX, y);
+      }
+      y += lineH;
+    }
+
+    if (asteroid.scanned && distance(ship.pos, asteroid.center) <= SCAN_DATA_DISPLAY_RANGE) {
+      y += 2;
+      ctx.fillStyle = "#8f97a3";
+      ctx.font = "11px monospace";
+      ctx.fillText("SCAN DATA — composition remaining in the main body", panelX, y);
+      y += 15;
+      const compositions: Cell["composition"][] = ["ore", "crystal", "unstable"];
+      for (const comp of compositions) {
+        const info = COMPOSITION_INFO[comp];
+        const remaining = asteroid.cells.filter((c) => !c.fractured && c.composition === comp).length;
+        ctx.fillStyle = "#cfd6e0";
+        ctx.font = "12px monospace";
+        ctx.fillText(
+          `${info.label}: ${remaining} intact   HARDNESS ${this.hardnessPips(info.hardness)}`,
+          panelX,
+          y,
+        );
+        y += lineH;
+      }
+    }
+
+    if (engine.message) {
+      ctx.font = "bold 15px monospace";
+      ctx.fillStyle = engine.message.color;
+      ctx.textAlign = "center";
+      ctx.globalAlpha = Math.min(1, engine.message.timer);
+      ctx.fillText(engine.message.text, width / 2, 20);
+      ctx.globalAlpha = 1;
+      ctx.textAlign = "left";
+    }
+
+    this.renderLegend(ctx, height);
+  }
+
+  private hardnessPips(hardness: number): string {
+    return "●".repeat(hardness) + "○".repeat(5 - hardness);
+  }
+
+  private renderLegend(ctx: CanvasRenderingContext2D, height: number) {
+    const lines = [
+      "WASD  thrust    Mouse  aim (cruise) / free (RCS)      SPACE  toggle Cruise / RCS",
+      "Q  ping      HOLD E  scan      TAB  cycle tool (1/2/3 select directly)      ESC/P  pause",
+      "LMB  laser cut / hold-anchor drill / place charge      R  detonate charges",
+    ];
+    ctx.font = "11px monospace";
+    ctx.fillStyle = "rgba(207,214,224,0.65)";
+    ctx.textAlign = "left";
+    let y = height - 16 - (lines.length - 1) * 14;
+    for (const line of lines) {
+      ctx.fillText(line, 16, y);
+      y += 14;
+    }
+  }
+
+  private renderPauseOverlay(ctx: CanvasRenderingContext2D, width: number, height: number) {
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillRect(0, 0, width, height);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#e8e8e8";
+    ctx.font = "bold 28px monospace";
+    ctx.fillText("PAUSED", width / 2, height / 2 - 24);
+    ctx.font = "13px monospace";
+    ctx.fillStyle = "#9099a8";
+    ctx.fillText("ESC or P to resume", width / 2, height / 2 + 10);
+    ctx.textAlign = "left";
+  }
+}
