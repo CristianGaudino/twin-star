@@ -13,6 +13,13 @@ import { Vec2, add, angleDelta, clamp, fromAngle, scale, sub, v2 } from "./vec2"
 
 export type MoveMode = "cruise" | "rcs";
 
+/** What caused a hit — required on every `takeImpact` call so future sources (enemy weapons,
+ *  hazards) can't silently skip tagging themselves, the same way `Explosion.source` is required.
+ *  Not consumed anywhere yet beyond being available; exists so per-source feedback (distinct hit
+ *  messages/sounds/flashes) has something to switch on once combat lands instead of needing a
+ *  retrofit across every call site. */
+export type DamageSource = "collision" | "explosion";
+
 export class Ship {
   pos: Vec2;
   vel: Vec2 = v2(0, 0);
@@ -102,7 +109,8 @@ export class Ship {
     this.pos = add(this.pos, scale(this.vel, dt));
   }
 
-  takeImpact(damage: number) {
+  takeImpact(damage: number, source: DamageSource) {
+    void source; // not consumed yet — see DamageSource
     this.hull = clamp(this.hull - damage, 0, MAX_HULL);
   }
 

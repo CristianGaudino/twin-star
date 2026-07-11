@@ -29,13 +29,23 @@ This was done now specifically *because* enemies/combat are next on the build or
 
 To make this work, a few things that were `private` on `Engine` became public surface for `Renderer` to read: `screenToWorld()`, `currentTarget`, `blastEffects`. Nothing else changed — `Engine` still fully owns mutation of its own state; `Renderer` only reads.
 
+## Done: decoupling mechanics from their one current trigger (this session)
+
+A recurring smell: a mechanic implemented only inside the one call site that currently needs it, rather than as a capability anything could reach. `Explosion`/`Engine.applyExplosion()` was the first fix (charges used to trigger blast logic directly; now charges just raise a generic `Explosion`). Same pass applied to two more:
+
+- **Tool signature cost** used to be a constant hand-matched to each tool's own code (`ship.addSignature(LASER_SIG_PER_SEC * dt)` inside `cutCell`, etc.) — nothing enforced it stayed in sync with the tool itself. Moved onto `ToolDef` (`sigPerSecond` / `sigPerUse` in `tools.ts`), read generically at each call site. A new tool now declares its own cost instead of needing a new hand-wired call.
+- **Collision impact damage** was inline math only `resolveAsteroidCollision` knew how to do. Pulled into `Engine.applyCollisionImpact(closingSpeed, source)` so a future enemy-ramming collision resolver can call the same formula instead of reimplementing it.
+- **`Ship.takeImpact`** now requires a `DamageSource` (`"collision" | "explosion"`) on every call, mirroring `Explosion.source` — not consumed anywhere yet, but future per-source feedback (distinct hit messages/sounds) has something to switch on without a retrofit across call sites.
+
+Left alone on purpose: `Cell.hasCharge` is charge-specific boolean state on a cell. It looks like the same smell, but there's only ever been one thing that attaches to a cell — generalizing to a device-type enum now would be designing for a feature that doesn't exist. Rule of three still applies.
+
 ## Not done yet, flagged for later
 
 **Scene/mode concept.** Everything currently assumes "always in the field" — there's no notion of being docked at a hub. The spec's own core loop (§3) starts with "dock at hub," and that doesn't exist at all yet. The moment it's built, `Engine` (or something above it) needs a mode switch (field vs. hub) that the current flat structure doesn't have. Not building this preemptively — it's speculative until the hub actually exists — but noting it so the next pass isn't a surprise.
 
 **HUD as DOM/React instead of hand-drawn canvas.** Current HUD is `ctx.fillText`/`ctx.fillRect` with manual `y += lineH` layout — fine for bars and status text, but the wrong tool for an actual hub shop/upgrade UI with buttons and lists. When the hub lands, the likely right move is a hybrid: canvas keeps the in-field HUD (targeting, bars, minimal text), a React overlay handles hub/menu screens. Not worth building the overlay plumbing before there's a screen that needs it.
 
-**Test suite.** Zero tests currently. The pure logic — `poly.ts` clipping/point-in-polygon, `physics.ts`'s impulse resolver, asteroid Voronoi generation and adjacency — is exactly the kind of deterministic logic that's cheap to unit test and where silent regressions are easy to introduce. This session had several rounds of "fix physics → break something else → fix that" (e.g. rock-vs-rock collision quietly not existing for a while after drift groups were introduced). A handful of tests around conservation properties in the impulse resolver and basic geometry invariants would catch that class of bug before it needs to be found by playing. Recommend Vitest — fast, no config fuss with this stack.
+**Test suite — started.** Vitest is now wired up (`npm test`), with `poly.test.ts` and `physics.test.ts` covering exactly the two files that caused the most "fix physics → break something else → fix that" cycles this session (geometry invariants — polygon area/centroid/second-moment, the corner-normal-blend regression, the `clampInsidePolygon` containment fix — and impulse-resolver conservation properties). Deliberately narrow: `engine.ts`, rendering, and entities are still changing too fast for tests to pay off there yet. Expand this suite as more pure logic (asteroid Voronoi generation/adjacency, drift-group split math) stabilizes, not preemptively.
 
 ## Deliberately not doing
 

@@ -1,5 +1,5 @@
 import { InputState } from "./input";
-import { Ship } from "./ship";
+import { DamageSource, Ship } from "./ship";
 import { Asteroid, Cell, COMPOSITION_INFO, CrackSegment, cellWorldToLocal } from "./asteroid";
 import { Chunk } from "./chunk";
 import { Contact, ContactMemory } from "./contacts";
@@ -29,7 +29,6 @@ import {
   CHARGE_CHUNK_PUSH_MAX,
   CHARGE_IMPULSE_PER_CHARGE,
   CHARGE_MAX_CARRIED,
-  CHARGE_SIG_PER_USE,
   CHUNK_CHUNK_RESTITUTION,
   CHUNK_COLLECT_RADIUS,
   CHUNK_SHIP_BUMP_RESTITUTION,
@@ -37,9 +36,7 @@ import {
   DRIFT_DAMPING,
   DRILL_ANCHOR_RANGE,
   DRILL_FRACTURE_GENERATIONS,
-  DRILL_SIG_PER_SEC,
   LASER_CUT_DEPTH,
-  LASER_SIG_PER_SEC,
   MAX_HULL,
   MIN_CELL_AREA,
   PING_COOLDOWN,
@@ -416,11 +413,7 @@ export class Engine {
     const closingSpeed = -dot(sub(ship.vel, contactVelRock), boundary.normal);
     if (closingSpeed <= 0) return; // already separating
 
-    if (closingSpeed > COLLISION_MIN_SPEED) {
-      const damage = (closingSpeed - COLLISION_MIN_SPEED) * COLLISION_DAMAGE_SCALE;
-      ship.takeImpact(damage);
-      this.setMessage(`HULL DAMAGE -${damage.toFixed(0)}`, "#ff6b6b");
-    }
+    this.applyCollisionImpact(closingSpeed, "collision");
 
     const result = resolveContact(shipBody, rockBody, boundary.point, boundary.normal, COLLISION_RESTITUTION);
     ship.vel = result.velA;
@@ -431,6 +424,16 @@ export class Engine {
 
     const tangent = sub(ship.vel, scale(boundary.normal, dot(ship.vel, boundary.normal)));
     ship.vel = add(scale(boundary.normal, dot(ship.vel, boundary.normal)), scale(tangent, 0.92));
+  }
+
+  /** Speed-scaled hull damage from a solid impact — shared by every collision resolver so a
+   *  future enemy ramming the ship (or the ship ramming an enemy) hits exactly the same way a
+   *  rock does, rather than each collision type reimplementing its own damage formula. */
+  private applyCollisionImpact(closingSpeed: number, source: DamageSource) {
+    if (closingSpeed <= COLLISION_MIN_SPEED) return;
+    const damage = (closingSpeed - COLLISION_MIN_SPEED) * COLLISION_DAMAGE_SCALE;
+    this.ship.takeImpact(damage, source);
+    this.setMessage(`HULL DAMAGE -${damage.toFixed(0)}`, "#ff6b6b");
   }
 
   /** Rock-vs-rock: separate drift groups now collide with each other instead of passing through.
@@ -820,7 +823,7 @@ export class Engine {
     const info = COMPOSITION_INFO[cell.composition];
     const mult = info.recommendedTool === "laser" ? TOOL_RECOMMENDED_MULT : TOOL_OFF_MULT;
     cell.cutProgress += dt * mult;
-    ship.addSignature(LASER_SIG_PER_SEC * dt);
+    ship.addSignature((TOOLS.laser.sigPerSecond ?? 0) * dt);
 
     const nearest = closestBoundaryPoint(cell.polygon, ship.pos);
     if (nearest) this.activeBeam = { from: ship.pos, to: nearest.point, tool: "laser" };
@@ -889,7 +892,7 @@ export class Engine {
       const info = COMPOSITION_INFO[validTarget.composition];
       const mult = info.recommendedTool === "drill" ? TOOL_RECOMMENDED_MULT : TOOL_OFF_MULT;
       validTarget.boreProgress += (dt * mult) / info.boreSeconds;
-      ship.addSignature(DRILL_SIG_PER_SEC * dt);
+      ship.addSignature((TOOLS.drill.sigPerSecond ?? 0) * dt);
       if (boundary) this.activeBeam = { from: ship.pos, to: boundary.point, tool: "drill" };
 
       if (validTarget.boreProgress >= 1) {
@@ -1015,7 +1018,7 @@ export class Engine {
       if (hit) shipHit = true;
     }
 
-    ship.addSignature(CHARGE_SIG_PER_USE * charged.length);
+    ship.addSignature((TOOLS.charges.sigPerUse ?? 0) * charged.length);
     this.setMessage(
       shipHit
         ? `DETONATED ${charged.length} CHARGE${charged.length > 1 ? "S" : ""} — CAUGHT IN THE BLAST`
@@ -1040,7 +1043,7 @@ export class Engine {
       shipHit = true;
       const falloff = 1 - shipDist / explosion.radius;
       const damage = explosion.shipDamage * falloff;
-      if (damage > 0.2) ship.takeImpact(damage);
+      if (damage > 0.2) ship.takeImpact(damage, "explosion");
       const pushDir = shipDist > 1e-6 ? normalize(sub(ship.pos, explosion.pos)) : v2(1, 0);
       ship.vel = add(ship.vel, scale(pushDir, explosion.shipPushSpeed * falloff));
     }
