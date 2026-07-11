@@ -15,8 +15,15 @@ export const CRUISE_TURN_RATE = 9; // rad/s, how fast facing eases toward the mo
 export const MAX_HULL = 100;
 export const COLLISION_DAMAGE_SCALE = 0.11; // hull lost = impact speed * scale
 export const COLLISION_MIN_SPEED = 55; // below this, a bump does no damage
-export const COLLISION_RESTITUTION = 0.45; // bounce-back factor
 export const POSITION_CORRECTION_RATE = 20; // per second — fraction of overlap closed each tick, smooths the pop-out
+
+// A frame where something moves far relative to its own size can skip clean over thin
+// geometry (a freshly laser-cut sliver, a chunk ejected point-blank from an extraction) since
+// collision is checked once per frame at the end position. Splitting a fast frame into a few
+// smaller steps (each with its own movement + collision pass) catches what one big jump would
+// miss, without needing full continuous/swept collision detection.
+export const COLLISION_SUBSTEP_TRAVEL = 6; // px — target max travel per body per substep
+export const MAX_COLLISION_SUBSTEPS = 4; // hard cap, so a runaway velocity can't blow up frame cost
 
 // One mass system, shared by every collision in the game (see physics.ts's RigidRef/
 // resolveContact, used for all of ship-rock, rock-rock, chunk-rock, chunk-chunk, and
@@ -28,6 +35,18 @@ export const POSITION_CORRECTION_RATE = 20; // per second — fraction of overla
 // heavy enough to barely register a nudge from one hit.
 export const SHIP_MASS = 30;
 export const ROCK_MASS_PER_AREA = 0.01; // px^2 -> mass
+
+// Materials (see physics.ts Material/combineMaterials) — each kind defines its own bounce and
+// grip exactly once; every pairing's behavior (ship-rock, chunk-rock, chunk-chunk, chunk-ship,
+// rock-rock) is *derived* by combining the two materials involved, not hand-tuned separately.
+// Values below were chosen to land close to this game's previously hand-tuned per-pair
+// constants once combined — expect pairings to feel very similar to before, not identical.
+export const SHIP_RESTITUTION = 0.55;
+export const SHIP_FRICTION = 0.92; // a little grip sliding along a surface, not frictionless
+export const ROCK_RESTITUTION = 0.35; // duller than ship/chunk — big dumb mass thudding
+export const ROCK_FRICTION = 1; // neutral: rock itself adds no extra drag, the other body does
+export const CHUNK_RESTITUTION = 0.5;
+export const CHUNK_FRICTION = 0.96; // light grip — was previously frictionless everywhere but the ship
 
 // --- Cargo ---
 export const CARGO_CAPACITY = 16;
@@ -107,10 +126,7 @@ export const SIGNATURE_DECAY_PER_SEC = 10;
 
 // --- Chunks ---
 export const CHUNK_DRAG = 0.15;
-export const CHUNK_COLLECT_RADIUS = 16;
-export const CHUNK_SHIP_BUMP_RESTITUTION = 0.6; // uncollected chunks bounce off the ship, no damage
-export const CHUNK_CHUNK_RESTITUTION = 0.5; // chunks bounce off each other too
-export const CHUNK_ROCK_RESTITUTION = 0.5; // and off the asteroid surface itself
+export const CHUNK_COLLECT_RADIUS = 16; // uncollected chunks still physically bump the ship, no damage — see CHUNK_RESTITUTION/CHUNK_FRICTION
 
 // --- Cursor hover (see hover.ts) ---
 // Extra forgiveness around a chunk's small collision radius so hovering one with the
@@ -133,7 +149,7 @@ export const HOVER_CHUNK_PADDING = 6; // px
 // blast impulse — changes a piece's velocity.
 export const DRIFT_DAMPING = 0.04; // per second — very light, so drift is slow and lasting
 export const ANGULAR_DAMPING = 0.06; // per second — spin settles a bit faster than translation
-export const ROCK_ROCK_RESTITUTION = 0.35; // duller than ship-rock — big dumb masses thudding together
+// Rock's own bounce/grip against another rock body — see ROCK_RESTITUTION/ROCK_FRICTION above.
 // With several cells per group near each other, the single "closest pair" used for the contact
 // point can jump between different cell pairs from one frame to the next as things settle —
 // each jump nudges the contact normal, and without a floor that noise can needle in tiny,

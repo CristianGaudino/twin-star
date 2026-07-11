@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { RigidRef, applyPointImpulse, resolveContact } from "./physics";
+import { Material, RigidRef, applyFriction, applyPointImpulse, combineMaterials, resolveContact } from "./physics";
 import { v2 } from "./vec2";
 
 const body = (overrides: Partial<RigidRef> = {}): RigidRef => ({
@@ -72,5 +72,51 @@ describe("applyPointImpulse", () => {
     const result = applyPointImpulse(b, v2(0, 1), v2(10, 0));
     // r = (0,1), impulse = (10,0): cross2(r, impulse) = 0*0 - 1*10 = -10
     expect(result.angVel).toBeCloseTo(-10, 6);
+  });
+});
+
+describe("combineMaterials", () => {
+  const material = (restitution: number, friction: number): Material => ({ restitution, friction });
+
+  it("averages restitution", () => {
+    const combined = combineMaterials(material(0.2, 1), material(0.8, 1));
+    expect(combined.restitution).toBeCloseTo(0.5, 6);
+  });
+
+  it("self-combines to its own value, so a pair of identical materials reproduces the base constant exactly", () => {
+    const combined = combineMaterials(material(0.35, 1), material(0.35, 1));
+    expect(combined.restitution).toBeCloseTo(0.35, 6);
+  });
+
+  it("multiplies friction, so a frictionless material never adds drag to a pairing", () => {
+    const combined = combineMaterials(material(0, 1), material(0, 0.9));
+    expect(combined.friction).toBeCloseTo(0.9, 6);
+  });
+
+  it("multiplies friction, so two grippy materials together end up grippier than either alone", () => {
+    const combined = combineMaterials(material(0, 0.9), material(0, 0.9));
+    expect(combined.friction).toBeCloseTo(0.81, 6);
+    expect(combined.friction).toBeLessThan(0.9);
+  });
+});
+
+describe("applyFriction", () => {
+  it("leaves velocity unchanged at friction 1 (frictionless)", () => {
+    const vel = v2(3, 4);
+    const result = applyFriction(vel, v2(0, 1), 1);
+    expect(result).toEqual(vel);
+  });
+
+  it("only scrubs the tangential component, leaving the normal component untouched", () => {
+    // normal (0,1): normal component is (0,4), tangential is (3,0)
+    const result = applyFriction(v2(3, 4), v2(0, 1), 0.5);
+    expect(result.x).toBeCloseTo(1.5, 6); // tangential half-scrubbed
+    expect(result.y).toBeCloseTo(4, 6); // normal component untouched
+  });
+
+  it("zeroes the tangential component entirely at friction 0", () => {
+    const result = applyFriction(v2(3, 4), v2(0, 1), 0);
+    expect(result.x).toBeCloseTo(0, 6);
+    expect(result.y).toBeCloseTo(4, 6);
   });
 });

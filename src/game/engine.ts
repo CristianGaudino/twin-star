@@ -1,6 +1,7 @@
 import { InputState } from "./input";
 import { DamageSource, Ship } from "./ship";
 import { Asteroid, Cell, COMPOSITION_INFO, CrackSegment, cellWorldToLocal } from "./asteroid";
+import { BodyHandle } from "./body";
 import { Chunk } from "./chunk";
 import { Contact, ContactMemory } from "./contacts";
 import { Explosion } from "./explosion";
@@ -19,7 +20,7 @@ import {
   polygonSecondMomentOfArea,
   sliceNearPoint,
 } from "./poly";
-import { RigidRef, applyPointImpulse, resolveContact } from "./physics";
+import { Material, RigidRef, applyFriction, applyPointImpulse, combineMaterials, resolveContact } from "./physics";
 import {
   ANGULAR_DAMPING,
   BLAST_VISUAL_DURATION,
@@ -30,16 +31,17 @@ import {
   CHARGE_CHUNK_PUSH_MAX,
   CHARGE_IMPULSE_PER_CHARGE,
   CHARGE_MAX_CARRIED,
-  CHUNK_CHUNK_RESTITUTION,
   CHUNK_COLLECT_RADIUS,
-  CHUNK_ROCK_RESTITUTION,
-  CHUNK_SHIP_BUMP_RESTITUTION,
+  CHUNK_FRICTION,
+  CHUNK_RESTITUTION,
+  COLLISION_SUBSTEP_TRAVEL,
   CONTACT_FORGET_AFTER,
   DRIFT_DAMPING,
   DRILL_ANCHOR_RANGE,
   DRILL_FRACTURE_GENERATIONS,
   HOVER_CHUNK_PADDING,
   LASER_CUT_DEPTH,
+  MAX_COLLISION_SUBSTEPS,
   MAX_HULL,
   MIN_CELL_AREA,
   PING_COOLDOWN,
@@ -47,20 +49,22 @@ import {
   PING_SPEED,
   POSITION_CORRECTION_RATE,
   ROCK_CONTACT_MIN_CLOSING_SPEED,
+  ROCK_FRICTION,
   ROCK_MASS_PER_AREA,
-  ROCK_ROCK_RESTITUTION,
+  ROCK_RESTITUTION,
   SCAN_HOLD_SECONDS,
   SCAN_PROGRESS_DECAY,
   SCAN_RANGE,
+  SHIP_FRICTION,
   SHIP_MASS,
   SHIP_RADIUS,
+  SHIP_RESTITUTION,
   SIGNATURE_DECAY_PER_SEC,
   TOOL_OFF_MULT,
   TOOL_RECOMMENDED_MULT,
   VISION_RADIUS,
   COLLISION_DAMAGE_SCALE,
   COLLISION_MIN_SPEED,
-  COLLISION_RESTITUTION,
 } from "./constants";
 import {
   Vec2,
@@ -104,6 +108,12 @@ const WORLD_BOX = 1600; // half-extent of the starfield box around the origin
 const TOOL_ORDER: ToolId[] = ["laser", "drill", "charges"];
 const SPAWN_POS: Vec2 = v2(0, 0);
 let nextGroupId = 1;
+
+// Each collidable kind's own material, defined once — see physics.ts's combineMaterials for
+// how a pair's actual bounce/grip is derived from these rather than hand-tuned per pairing.
+const SHIP_MATERIAL: Material = { restitution: SHIP_RESTITUTION, friction: SHIP_FRICTION };
+const ROCK_MATERIAL: Material = { restitution: ROCK_RESTITUTION, friction: ROCK_FRICTION };
+const CHUNK_MATERIAL: Material = { restitution: CHUNK_RESTITUTION, friction: CHUNK_FRICTION };
 
 export class Engine {
   ship: Ship;
@@ -195,9 +205,19 @@ export class Engine {
     this.updateDriftGroups(dt);
     this.resolveGroupCollisions(dt);
 
+    // Substepped so a fast frame (cruise top speed, or right after a hard hit) can't skip
+    // clean over thin geometry — a freshly laser-cut sliver is easily thinner than one frame's
+    // travel at speed. Costs nothing extra when moving slowly (see substepsFor).
+    const shipSteps = this.substepsFor(length(ship.vel), dt);
+    const shipSubDt = dt / shipSteps;
+    for (let s = 0; s < shipSteps; s++) {
+      const stepMouse = this.screenToWorld(input.mouseScreen);
+      ship.updateMovement(shipSubDt, input, stepMouse);
+      const result = this.resolveBodyVsRock(this.shipBody(), shipSubDt);
+      if (result) this.reactToCollision(result.kind, "rock", result.closingSpeed);
+    }
+
     const worldMouse = this.screenToWorld(input.mouseScreen);
-    ship.updateMovement(dt, input, worldMouse);
-    this.resolveAsteroidCollision(dt);
 
     // Cursor highlighting is informational only — unlike tool targeting (currentTarget,
     // set in updateMining) it doesn't care what's selected or which mode the ship is in.
@@ -276,9 +296,23 @@ export class Engine {
 
     // --- chunks ---
     this.cargoFullMessageCooldown = Math.max(0, this.cargoFullMessageCooldown - dt);
-    for (const chunk of this.chunks) chunk.update(dt);
-    this.resolveChunkCollisions(dt);
-    this.resolveChunkChunkCollisions(dt);
+
+    // Same tunneling insurance as the ship — a chunk ejected point-blank from an extraction
+    // starts touching the rock it just left and can be moving fast enough to skip past it in
+    // a single frame otherwise.
+    let fastestChunk = 0;
+    for (const chunk of this.chunks) fastestChunk = Math.max(fastestChunk, length(chunk.vel));
+    const chunkSteps = this.substepsFor(fastestChunk, dt);
+    const chunkSubDt = dt / chunkSteps;
+    for (let s = 0; s < chunkSteps; s++) {
+      for (const chunk of this.chunks) chunk.update(chunkSubDt);
+      for (const chunk of this.chunks) {
+        const result = this.resolveBodyVsRock(this.chunkBody(chunk), chunkSubDt);
+        if (result) this.reactToCollision(result.kind, "rock", result.closingSpeed);
+      }
+    }
+    this.resolveCircleCollisions(dt); // chunk-chunk + chunk-ship, one generic sweep
+
     this.chunks = this.chunks.filter((chunk) => {
       const d = distance(chunk.pos, ship.pos);
       if (d < SHIP_RADIUS + CHUNK_COLLECT_RADIUS) {
@@ -298,7 +332,6 @@ export class Engine {
       }
       return true;
     });
-    this.resolveChunkShipBumps(dt);
 
     if (this.message) {
       this.message.timer -= dt;
@@ -392,48 +425,6 @@ export class Engine {
     return mask;
   }
 
-  /** Ship-vs-rock collision, resolved as a real rigid-body contact against the rock's actual
-   *  velocity *and spin* (not just its center velocity) — a moving or spinning piece properly
-   *  shoves the ship instead of just snapping its position every frame. The ship itself never
-   *  spins from a hit (its orientation is player/thruster-controlled, not tumbling debris). */
-  private resolveAsteroidCollision(dt: number) {
-    const { ship } = this;
-    const contact = this.findCellContact(ship.pos, SHIP_RADIUS);
-    if (!contact) return;
-    const { cell, boundary } = contact;
-
-    // Close the overlap gradually rather than snapping straight to the surface —
-    // a hard teleport is what reads as a "jump" when the rock itself is moving. The resting
-    // distance here MUST match the radius findCellContact uses to detect contact in the first
-    // place (SHIP_RADIUS) — a smaller "nestle in visually" offset here previously meant the
-    // ship could never actually reach a position collision considered fully resolved, so it
-    // stayed flagged as touching (and kept getting pulled back / re-impulsed) indefinitely.
-    const targetPos = add(boundary.point, scale(boundary.normal, SHIP_RADIUS + 0.5));
-    const correctionFactor = Math.min(1, POSITION_CORRECTION_RATE * dt);
-    ship.pos = add(ship.pos, scale(sub(targetPos, ship.pos), correctionFactor));
-
-    const group = this.driftGroupOf(cell);
-    const rockBody = this.rigidRefForGroup(group);
-    const shipBody = this.rigidRefForShip();
-
-    const rB = sub(boundary.point, rockBody.pos);
-    const contactVelRock = velocityAtPoint(rockBody.vel, rockBody.angVel, rB);
-    const closingSpeed = -dot(sub(ship.vel, contactVelRock), boundary.normal);
-    if (closingSpeed <= 0) return; // already separating
-
-    this.applyCollisionImpact(closingSpeed, "collision");
-
-    const result = resolveContact(shipBody, rockBody, boundary.point, boundary.normal, COLLISION_RESTITUTION);
-    ship.vel = result.velA;
-    if (group) {
-      group.vel = result.velB;
-      group.angularVelocity = result.angVelB;
-    }
-
-    const tangent = sub(ship.vel, scale(boundary.normal, dot(ship.vel, boundary.normal)));
-    ship.vel = add(scale(boundary.normal, dot(ship.vel, boundary.normal)), scale(tangent, 0.92));
-  }
-
   /** Speed-scaled hull damage from a solid impact — shared by every collision resolver so a
    *  future enemy ramming the ship (or the ship ramming an enemy) hits exactly the same way a
    *  rock does, rather than each collision type reimplementing its own damage formula. */
@@ -442,6 +433,154 @@ export class Engine {
     const damage = (closingSpeed - COLLISION_MIN_SPEED) * COLLISION_DAMAGE_SCALE;
     this.ship.takeImpact(damage, source);
     this.setMessage(`HULL DAMAGE -${damage.toFixed(0)}`, "#ff6b6b");
+  }
+
+  /** The only place collision *reactions* (as opposed to the physics itself) are decided.
+   *  Adding a new kind that should take or deal damage is one more line here, not a new
+   *  physics resolver. Only a solid hit against rock currently damages the ship — a loose
+   *  chunk bump stays a soft nudge, matching the game's previous behavior exactly. */
+  private reactToCollision(kindA: string, kindB: string, closingSpeed: number) {
+    const involvesShip = kindA === "ship" || kindB === "ship";
+    const involvesRock = kindA === "rock" || kindB === "rock";
+    if (involvesShip && involvesRock) {
+      this.applyCollisionImpact(closingSpeed, "collision");
+    }
+  }
+
+  /** How many smaller steps to split a frame's movement+collision into, so a fast-moving body
+   *  can't skip clean over thin geometry between one frame and the next (see
+   *  COLLISION_SUBSTEP_TRAVEL) — cheap insurance against tunneling without full continuous
+   *  collision detection. Costs nothing extra at normal speeds (returns 1). */
+  private substepsFor(speed: number, dt: number): number {
+    const steps = Math.ceil((speed * dt) / COLLISION_SUBSTEP_TRAVEL);
+    return Math.min(MAX_COLLISION_SUBSTEPS, Math.max(1, steps));
+  }
+
+  private shipBody(): BodyHandle {
+    const { ship } = this;
+    return {
+      body: { kind: "ship", pos: ship.pos, vel: ship.vel, radius: SHIP_RADIUS, mass: SHIP_MASS, material: SHIP_MATERIAL },
+      write: (pos, vel) => {
+        ship.pos = pos;
+        ship.vel = vel;
+      },
+    };
+  }
+
+  private chunkBody(chunk: Chunk): BodyHandle {
+    return {
+      body: { kind: "chunk", pos: chunk.pos, vel: chunk.vel, radius: chunk.radius, mass: chunk.mass, material: CHUNK_MATERIAL },
+      write: (pos, vel) => {
+        chunk.pos = pos;
+        chunk.vel = vel;
+      },
+    };
+  }
+
+  /** Every circle-shaped, independently-moving thing in the world right now. Anything added
+   *  here automatically collides correctly with everything else on this list *and* with rock
+   *  through the shared resolvers below — a future circular entity (a drone, a simple enemy)
+   *  is one more line here, not a new collision method. */
+  private circleBodies(): BodyHandle[] {
+    const handles: BodyHandle[] = [this.shipBody()];
+    for (const chunk of this.chunks) handles.push(this.chunkBody(chunk));
+    return handles;
+  }
+
+  /** One circle body against another — the physics (mass, material-derived bounce/friction,
+   *  position correction) is fully generic; only the geometry (both are circles) and the
+   *  reaction (see reactToCollision) know which kinds are actually involved. */
+  private resolveBodyPair(a: BodyHandle, b: BodyHandle, dt: number): { kindA: string; kindB: string; closingSpeed: number } | null {
+    const d = distance(a.body.pos, b.body.pos);
+    const minDist = a.body.radius + b.body.radius;
+    if (d >= minDist || d < 1e-6) return null;
+
+    const normal = scale(sub(a.body.pos, b.body.pos), 1 / d);
+    const contact = scale(add(a.body.pos, b.body.pos), 0.5);
+    const refA: RigidRef = { pos: a.body.pos, vel: a.body.vel, angVel: 0, invMass: 1 / a.body.mass, invInertia: 0 };
+    const refB: RigidRef = { pos: b.body.pos, vel: b.body.vel, angVel: 0, invMass: 1 / b.body.mass, invInertia: 0 };
+    const material = combineMaterials(a.body.material, b.body.material);
+
+    const closingSpeed = -dot(sub(refA.vel, refB.vel), normal);
+    let velA = refA.vel;
+    let velB = refB.vel;
+    if (closingSpeed > 0) {
+      const result = resolveContact(refA, refB, contact, normal, material.restitution);
+      velA = applyFriction(result.velA, normal, material.friction);
+      velB = applyFriction(result.velB, normal, material.friction);
+    }
+
+    let posA = a.body.pos;
+    let posB = b.body.pos;
+    const penetration = minDist - d;
+    const totalInv = refA.invMass + refB.invMass;
+    if (penetration > 0 && totalInv > 1e-9) {
+      const factor = Math.min(1, POSITION_CORRECTION_RATE * dt);
+      posA = add(a.body.pos, scale(normal, penetration * (refA.invMass / totalInv) * factor));
+      posB = sub(b.body.pos, scale(normal, penetration * (refB.invMass / totalInv) * factor));
+    }
+
+    a.write(posA, velA);
+    b.write(posB, velB);
+    return { kindA: a.body.kind, kindB: b.body.kind, closingSpeed };
+  }
+
+  /** All-pairs circle-vs-circle collision (chunk-chunk, chunk-ship) in one generic sweep —
+   *  the ship only ever appears once, so this naturally covers both without two methods. */
+  private resolveCircleCollisions(dt: number) {
+    const bodies = this.circleBodies();
+    for (let i = 0; i < bodies.length; i++) {
+      for (let j = i + 1; j < bodies.length; j++) {
+        const result = this.resolveBodyPair(bodies[i], bodies[j], dt);
+        if (result) this.reactToCollision(result.kindA, result.kindB, result.closingSpeed);
+      }
+    }
+  }
+
+  /** A circle body against the asteroid's irregular polygon geometry — a real rigid-body
+   *  contact against the rock's actual velocity *and* spin at the contact point (not just its
+   *  center velocity), so a moving or spinning piece properly shoves whatever hits it. Shared
+   *  by the ship and every chunk instead of being duplicated per kind. */
+  private resolveBodyVsRock(handle: BodyHandle, dt: number): { kind: string; closingSpeed: number } | null {
+    const contact = this.findCellContact(handle.body.pos, handle.body.radius);
+    if (!contact) return null;
+    const { cell, boundary } = contact;
+
+    // Close the overlap gradually rather than snapping straight to the surface — a hard
+    // teleport is what reads as a "jump" when the rock itself is moving. The resting distance
+    // here MUST match the radius findCellContact used to detect the contact, or the body can
+    // never actually reach a position collision considers fully resolved.
+    const targetPos = add(boundary.point, scale(boundary.normal, handle.body.radius + 0.5));
+    const correctionFactor = Math.min(1, POSITION_CORRECTION_RATE * dt);
+    const correctedPos = add(handle.body.pos, scale(sub(targetPos, handle.body.pos), correctionFactor));
+
+    const group = this.driftGroupOf(cell);
+    const rockBody = this.rigidRefForGroup(group);
+    const bodyRef: RigidRef = {
+      pos: correctedPos,
+      vel: handle.body.vel,
+      angVel: 0,
+      invMass: 1 / handle.body.mass,
+      invInertia: 0,
+    };
+
+    const rB = sub(boundary.point, rockBody.pos);
+    const contactVelRock = velocityAtPoint(rockBody.vel, rockBody.angVel, rB);
+    const closingSpeed = -dot(sub(bodyRef.vel, contactVelRock), boundary.normal);
+
+    let velOut = bodyRef.vel;
+    if (closingSpeed > 0) {
+      const material = combineMaterials(handle.body.material, ROCK_MATERIAL);
+      const result = resolveContact(bodyRef, rockBody, boundary.point, boundary.normal, material.restitution);
+      velOut = applyFriction(result.velA, boundary.normal, material.friction);
+      if (group) {
+        group.vel = result.velB;
+        group.angularVelocity = result.angVelB;
+      }
+    }
+
+    handle.write(correctedPos, velOut);
+    return { kind: handle.body.kind, closingSpeed };
   }
 
   /** Rock-vs-rock: separate drift groups now collide with each other instead of passing through.
@@ -495,10 +634,11 @@ export class Engine {
     const rB = sub(contact, bodyB.pos);
     const closingSpeed = -dot(sub(velocityAtPoint(bodyA.vel, bodyA.angVel, rA), velocityAtPoint(bodyB.vel, bodyB.angVel, rB)), normal);
     if (closingSpeed > ROCK_CONTACT_MIN_CLOSING_SPEED) {
-      const result = resolveContact(bodyA, bodyB, contact, normal, ROCK_ROCK_RESTITUTION);
-      groupA.vel = result.velA;
+      const material = combineMaterials(ROCK_MATERIAL, ROCK_MATERIAL);
+      const result = resolveContact(bodyA, bodyB, contact, normal, material.restitution);
+      groupA.vel = applyFriction(result.velA, normal, material.friction);
       groupA.angularVelocity = result.angVelA;
-      groupB.vel = result.velB;
+      groupB.vel = applyFriction(result.velB, normal, material.friction);
       groupB.angularVelocity = result.angVelB;
     }
 
@@ -570,22 +710,6 @@ export class Engine {
     };
   }
 
-  /** The ship's rigid-body reference, built fresh from its current position/velocity each
-   *  call — `SHIP_MASS` is the one place the ship's mass is ever defined, so every collision
-   *  the ship takes part in (ship-rock, chunk-ship) reacts to the same physical weight. Never
-   *  spins from a hit (invInertia 0) — the ship's orientation is player/thruster-controlled. */
-  private rigidRefForShip(): RigidRef {
-    const { ship } = this;
-    return { pos: ship.pos, vel: ship.vel, angVel: 0, invMass: 1 / SHIP_MASS, invInertia: 0 };
-  }
-
-  /** A chunk's rigid-body reference — `Chunk.mass` (shared density with rock, see
-   *  ROCK_MASS_PER_AREA) is the one place a chunk's mass is defined. No rotational coupling
-   *  (invInertia 0): a chunk's spin is purely cosmetic and never exchanged in a collision. */
-  private rigidRefForChunk(chunk: Chunk): RigidRef {
-    return { pos: chunk.pos, vel: chunk.vel, angVel: 0, invMass: 1 / chunk.mass, invInertia: 0 };
-  }
-
   private groupBoundingRadius(group: DriftGroup, com: Vec2): number {
     let maxR = 0;
     for (const cell of group.cells) {
@@ -608,101 +732,6 @@ export class Engine {
         label: "Rock Mass",
       };
     });
-  }
-
-  /** Keeps drifting/collected chunks from passing straight through solid rock — a real
-   *  two-body contact against the rock's actual velocity and spin, the same as ship-vs-rock,
-   *  so a chunk resting on a spinning piece gets carried/flung by it instead of only ever
-   *  reacting to its own velocity. */
-  private resolveChunkCollisions(dt: number) {
-    for (const chunk of this.chunks) {
-      const contact = this.findCellContact(chunk.pos, chunk.radius);
-      if (!contact) continue;
-      const { cell, boundary } = contact;
-
-      // Same fix as the ship: resting distance must match the radius findCellContact
-      // used to detect the contact, or the chunk can never fully clear "touching."
-      const targetPos = add(boundary.point, scale(boundary.normal, chunk.radius + 0.5));
-      const correctionFactor = Math.min(1, POSITION_CORRECTION_RATE * dt);
-      chunk.pos = add(chunk.pos, scale(sub(targetPos, chunk.pos), correctionFactor));
-
-      const group = this.driftGroupOf(cell);
-      const rockBody = this.rigidRefForGroup(group);
-      const chunkBody = this.rigidRefForChunk(chunk);
-
-      const rB = sub(boundary.point, rockBody.pos);
-      const contactVelRock = velocityAtPoint(rockBody.vel, rockBody.angVel, rB);
-      const closingSpeed = -dot(sub(chunk.vel, contactVelRock), boundary.normal);
-      if (closingSpeed <= 0) continue; // already separating
-
-      const result = resolveContact(chunkBody, rockBody, boundary.point, boundary.normal, CHUNK_ROCK_RESTITUTION);
-      chunk.vel = result.velA;
-      if (group) {
-        group.vel = result.velB;
-        group.angularVelocity = result.angVelB;
-      }
-    }
-  }
-
-  /** Loose chunks bump each other instead of passing through. No rotational coupling (chunks
-   *  only need real linear momentum; their spin is purely cosmetic) — same shared resolver as
-   *  every other collision in the game, just with invInertia 0 on both sides. */
-  private resolveChunkChunkCollisions(dt: number) {
-    for (let i = 0; i < this.chunks.length; i++) {
-      for (let j = i + 1; j < this.chunks.length; j++) {
-        this.resolveChunkPair(this.chunks[i], this.chunks[j], dt);
-      }
-    }
-  }
-
-  private resolveChunkPair(a: Chunk, b: Chunk, dt: number) {
-    const d = distance(a.pos, b.pos);
-    const minDist = a.radius + b.radius;
-    if (d >= minDist || d < 1e-6) return;
-
-    const normal = scale(sub(a.pos, b.pos), 1 / d);
-    const contact = scale(add(a.pos, b.pos), 0.5);
-    const bodyA = this.rigidRefForChunk(a);
-    const bodyB = this.rigidRefForChunk(b);
-
-    const result = resolveContact(bodyA, bodyB, contact, normal, CHUNK_CHUNK_RESTITUTION);
-    a.vel = result.velA;
-    b.vel = result.velB;
-
-    const penetration = minDist - d;
-    const totalInv = bodyA.invMass + bodyB.invMass;
-    if (totalInv > 1e-9) {
-      const factor = Math.min(1, POSITION_CORRECTION_RATE * dt);
-      a.pos = add(a.pos, scale(normal, penetration * (bodyA.invMass / totalInv) * factor));
-      b.pos = sub(b.pos, scale(normal, penetration * (bodyB.invMass / totalInv) * factor));
-    }
-  }
-
-  /** Chunks the ship couldn't collect (cargo full) still physically bump it — no damage. */
-  private resolveChunkShipBumps(dt: number) {
-    const { ship } = this;
-    for (const chunk of this.chunks) {
-      const d = distance(ship.pos, chunk.pos);
-      const minDist = SHIP_RADIUS + chunk.radius;
-      if (d >= minDist || d < 1e-6) continue;
-
-      const normal = scale(sub(ship.pos, chunk.pos), 1 / d);
-      const contact = scale(add(ship.pos, chunk.pos), 0.5);
-      const shipBody = this.rigidRefForShip();
-      const chunkBody = this.rigidRefForChunk(chunk);
-
-      const result = resolveContact(shipBody, chunkBody, contact, normal, CHUNK_SHIP_BUMP_RESTITUTION);
-      ship.vel = result.velA;
-      chunk.vel = result.velB;
-
-      const penetration = minDist - d;
-      const totalInv = shipBody.invMass + chunkBody.invMass;
-      if (totalInv > 1e-9) {
-        const factor = Math.min(1, POSITION_CORRECTION_RATE * dt);
-        ship.pos = add(ship.pos, scale(normal, penetration * (shipBody.invMass / totalInv) * factor));
-        chunk.pos = sub(chunk.pos, scale(normal, penetration * (chunkBody.invMass / totalInv) * factor));
-      }
-    }
   }
 
   /** Recomputes which clusters of intact cells are still connected to the main mass.
