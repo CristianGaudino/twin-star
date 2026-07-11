@@ -209,12 +209,8 @@ export class Renderer {
         ? COMPOSITION_INFO[hover.cell.composition].label
         : "unidentified";
     } else {
-      const p = toScreen(hover.chunk.pos);
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, hover.chunk.radius + 4, 0, Math.PI * 2);
-      ctx.stroke();
+      // Chunks are small and already visually distinct (loose debris drifting on its own) —
+      // an outline circle around them just added clutter. Tooltip only.
       label = COMPOSITION_INFO[hover.chunk.composition].label;
     }
 
