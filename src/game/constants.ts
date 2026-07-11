@@ -51,6 +51,13 @@ export const CHUNK_FRICTION = 0.96; // light grip — was previously frictionles
 // --- Cargo ---
 export const CARGO_CAPACITY = 16;
 
+// --- Hub ---
+// The home base: a fixed point you dock at to deposit whatever's in the hold. Deliberately no
+// currency conversion — materials are stored as-is, spent directly on whatever needs them
+// later (upgrades, crafting), not abstracted into a number first.
+export const HUB_RADIUS = 34; // px, visual size in the field
+export const HUB_DOCK_RANGE = 70; // px — how close the ship needs to be to dock
+
 // --- Asteroid shape (irregular rock, Voronoi-cell interior) ---
 export const ASTEROID_BASE_RADIUS = 190;
 export const ASTEROID_OUTLINE_POINTS = 26;

@@ -10,6 +10,8 @@ import {
   CONTACT_FORGET_AFTER,
   DRILL_ANCHOR_RANGE,
   DRILL_FRACTURE_GENERATIONS,
+  HUB_DOCK_RANGE,
+  HUB_RADIUS,
   PING_MAX_RADIUS,
   SCAN_DATA_DISPLAY_RANGE,
   SCAN_RANGE,
@@ -25,6 +27,12 @@ import { Vec2, add, distance, normalize, scale, sub, v2 } from "./vec2";
  */
 export class Renderer {
   render(engine: Engine, ctx: CanvasRenderingContext2D, width: number, height: number) {
+    if (engine.scene === "hub") {
+      this.renderHubScene(engine, ctx, width, height);
+      if (engine.paused) this.renderPauseOverlay(ctx, width, height);
+      return;
+    }
+
     const { ship, asteroid } = engine;
     const offset = sub(ship.pos, v2(width / 2, height / 2));
     const toScreen = (p: Vec2): Vec2 => sub(p, offset);
@@ -33,6 +41,7 @@ export class Renderer {
     ctx.fillRect(0, 0, width, height);
 
     this.renderStars(engine, ctx, toScreen, width, height);
+    this.renderHubMarker(engine, ctx, toScreen);
 
     if (engine.pingActive) {
       const p = toScreen(ship.pos);
@@ -96,6 +105,44 @@ export class Renderer {
       ctx.beginPath();
       ctx.arc(p.x, p.y, star.r, 0, Math.PI * 2);
       ctx.fill();
+    }
+  }
+
+  /** The home hub as it appears out in the field — a plain placeholder ring for now (spec's
+   *  visual direction isn't decided yet, and there's nothing to visually grow into until
+   *  upgrades exist). Shows a dock prompt only once actually in range. */
+  private renderHubMarker(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+    const p = toScreen(engine.hub.pos);
+
+    ctx.strokeStyle = "rgba(127,224,141,0.7)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, HUB_RADIUS, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.strokeStyle = "rgba(127,224,141,0.35)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, HUB_RADIUS * 0.6, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(127,224,141,0.9)";
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (engine.nearHub) {
+      ctx.strokeStyle = "rgba(127,224,141,0.6)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, HUB_DOCK_RANGE, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.font = "bold 13px monospace";
+      ctx.fillStyle = "#7de08d";
+      ctx.textAlign = "center";
+      ctx.fillText("[F] DOCK", p.x, p.y - HUB_RADIUS - 16);
+      ctx.textAlign = "left";
     }
   }
 
@@ -417,10 +464,14 @@ export class Renderer {
     const t = Math.min(tX, tY);
     const pos = add(center, scale(dir, t));
 
+    // Home reads as a distinct color from everything else on radar — it's not a discovery,
+    // it's always there.
+    const rgb = contact.kind === "hub" ? "127,224,141" : "127,224,255";
+
     ctx.save();
     ctx.translate(pos.x, pos.y);
     ctx.rotate(Math.atan2(dir.y, dir.x));
-    ctx.fillStyle = `rgba(127,224,255,${alpha})`;
+    ctx.fillStyle = `rgba(${rgb},${alpha})`;
     ctx.beginPath();
     ctx.moveTo(8, 0);
     ctx.lineTo(-6, -6);
@@ -431,7 +482,7 @@ export class Renderer {
 
     // Rounded, not exact — a ping gives a bearing and a rough range, not a precise fix.
     const dist = Math.round(distance(ship.pos, contact.pos) / 10) * 10;
-    ctx.fillStyle = `rgba(127,224,255,${alpha})`;
+    ctx.fillStyle = `rgba(${rgb},${alpha})`;
     ctx.font = "11px monospace";
     ctx.textAlign = "center";
     ctx.fillText(`${dist}m`, pos.x, pos.y + (dir.y > 0 ? 18 : -12));
@@ -553,7 +604,7 @@ export class Renderer {
     const lines = [
       "WASD  thrust    Mouse  aim (cruise) / free (RCS)      SPACE  toggle Cruise / RCS",
       "Q  ping      HOLD E  scan      TAB  cycle tool (1/2/3 select directly)      ESC/P  pause",
-      "LMB  laser cut / hold-anchor drill / place charge      R  detonate charges",
+      "LMB  laser cut / hold-anchor drill / place charge      R  detonate charges      F  dock at hub",
     ];
     ctx.font = "11px monospace";
     ctx.fillStyle = "rgba(207,214,224,0.65)";
@@ -563,6 +614,49 @@ export class Renderer {
       ctx.fillText(line, 16, y);
       y += 14;
     }
+  }
+
+  /** The hub screen — deliberately its own clean full-screen view rather than a panel over the
+   *  field, so docking reads as actually being somewhere else and safe, not just paused mid-air.
+   *  No shop/upgrades yet (see ARCHITECTURE.md) — just the materials tally and a way back out. */
+  private renderHubScene(engine: Engine, ctx: CanvasRenderingContext2D, width: number, height: number) {
+    const { hub } = engine;
+
+    ctx.fillStyle = "#050a12";
+    ctx.fillRect(0, 0, width, height);
+
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#7de08d";
+    ctx.font = "bold 22px monospace";
+    ctx.fillText("HOME HUB", width / 2, height / 2 - 120);
+
+    ctx.font = "12px monospace";
+    ctx.fillStyle = "rgba(207,214,224,0.7)";
+    ctx.fillText("MATERIALS IN STORAGE", width / 2, height / 2 - 74);
+
+    const compositions: Cell["composition"][] = ["ore", "crystal", "unstable"];
+    let y = height / 2 - 40;
+    for (const comp of compositions) {
+      const info = COMPOSITION_INFO[comp];
+      ctx.font = "16px monospace";
+      ctx.fillStyle = info.color;
+      ctx.fillText(`${info.label}: ${hub.materials[comp]}`, width / 2, y);
+      y += 28;
+    }
+
+    ctx.font = "13px monospace";
+    ctx.fillStyle = "#9099a8";
+    ctx.fillText("[F] LAUNCH", width / 2, y + 26);
+
+    if (engine.message) {
+      ctx.font = "bold 15px monospace";
+      ctx.fillStyle = engine.message.color;
+      ctx.globalAlpha = Math.min(1, engine.message.timer);
+      ctx.fillText(engine.message.text, width / 2, 40);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.textAlign = "left";
   }
 
   private renderPauseOverlay(ctx: CanvasRenderingContext2D, width: number, height: number) {

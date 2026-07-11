@@ -1,11 +1,12 @@
 import { Vec2 } from "./vec2";
 
 /**
- * Anything the ping/radar system can detect. Rock pieces are the only kind that exist today,
- * but this is deliberately generic — other asteroids, satellites, drones, enemies, and other
- * ships should all be able to show up here later without changing how ping/radar work.
+ * Anything the ping/radar system can detect. Rock and the home hub are the only kinds that
+ * exist today, but this is deliberately generic — other asteroids, satellites, drones,
+ * enemies, and other ships should all be able to show up here later without changing how
+ * ping/radar work.
  */
-export type ContactKind = "rock";
+export type ContactKind = "rock" | "hub";
 
 export interface Contact {
   id: string; // stable across frames for a given physical thing, so "discovered" persists

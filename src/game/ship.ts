@@ -8,8 +8,15 @@ import {
   SHIP_THRUST_ACCEL,
 } from "./constants";
 import { CHARGE_MAX_CARRIED } from "./constants";
+import { Composition } from "./asteroid";
 import { ToolId } from "./tools";
 import { Vec2, add, angleDelta, clamp, fromAngle, scale, sub, v2 } from "./vec2";
+
+/** What's actually in the hold — raw materials, not an abstract currency. Deposited at the
+ *  hub as-is; whatever they get used for later (upgrades, crafting) draws from these directly. */
+export type CargoHold = Record<Composition, number>;
+
+const emptyCargo = (): CargoHold => ({ ore: 0, crystal: 0, unstable: 0 });
 
 export type MoveMode = "cruise" | "rcs";
 
@@ -27,7 +34,7 @@ export class Ship {
   mode: MoveMode = "cruise";
 
   hull = MAX_HULL;
-  cargoUsed = 0;
+  cargo: CargoHold = emptyCargo();
   cargoCapacity = CARGO_CAPACITY;
   signature = 0;
 
@@ -43,6 +50,10 @@ export class Ship {
 
   get isAlive() {
     return this.hull > 0;
+  }
+
+  get cargoUsed(): number {
+    return this.cargo.ore + this.cargo.crystal + this.cargo.unstable;
   }
 
   get cargoFull() {
@@ -114,10 +125,18 @@ export class Ship {
     this.hull = clamp(this.hull - damage, 0, MAX_HULL);
   }
 
-  addCargo(value: number): number {
+  addCargo(composition: Composition, value: number): number {
     const room = this.cargoCapacity - this.cargoUsed;
     const taken = Math.min(room, value);
-    this.cargoUsed += taken;
+    this.cargo[composition] += taken;
+    return taken;
+  }
+
+  /** Empties the hold entirely, returning what was taken — e.g. to deposit at the hub, or
+   *  lose on destruction. */
+  clearCargo(): CargoHold {
+    const taken = this.cargo;
+    this.cargo = emptyCargo();
     return taken;
   }
 

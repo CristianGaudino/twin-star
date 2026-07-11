@@ -6,6 +6,7 @@ import { Chunk } from "./chunk";
 import { Contact, ContactMemory } from "./contacts";
 import { Explosion } from "./explosion";
 import { HoverTarget } from "./hover";
+import { Hub } from "./hub";
 import { TOOLS, ToolId } from "./tools";
 import {
   BoundaryHit,
@@ -40,6 +41,8 @@ import {
   DRILL_ANCHOR_RANGE,
   DRILL_FRACTURE_GENERATIONS,
   HOVER_CHUNK_PADDING,
+  HUB_DOCK_RANGE,
+  HUB_RADIUS,
   LASER_CUT_DEPTH,
   MAX_COLLISION_SUBSTEPS,
   MAX_HULL,
@@ -118,11 +121,17 @@ const CHUNK_MATERIAL: Material = { restitution: CHUNK_RESTITUTION, friction: CHU
 export class Engine {
   ship: Ship;
   asteroid: Asteroid;
+  hub: Hub;
   chunks: Chunk[] = [];
   input: InputState;
   stars: Star[] = [];
 
   paused = false;
+  // "field" is everything that exists today; "hub" is a distinct, much simpler screen — see
+  // updateHub/updateDocking. Flagged as the next architectural seam in ARCHITECTURE.md before
+  // this landed.
+  scene: "field" | "hub" = "field";
+  nearHub = false; // read by Renderer for the "[F] DOCK" prompt
 
   pingActive = false;
   pingRadius = 0;
@@ -150,6 +159,7 @@ export class Engine {
   constructor(canvas: HTMLCanvasElement) {
     this.input = new InputState(canvas);
     this.ship = new Ship(SPAWN_POS);
+    this.hub = new Hub({ ...SPAWN_POS });
     const asteroidAngle = Math.random() * Math.PI * 2;
     const asteroidDist = 620;
     this.asteroid = new Asteroid(fromAngle(asteroidAngle, asteroidDist));
@@ -193,6 +203,12 @@ export class Engine {
       return;
     }
 
+    if (this.scene === "hub") {
+      this.updateHub(dt);
+      input.endFrame();
+      return;
+    }
+
     const { ship, asteroid } = this;
 
     if (input.wasJustPressed(" ")) ship.toggleMode();
@@ -219,6 +235,8 @@ export class Engine {
 
     const worldMouse = this.screenToWorld(input.mouseScreen);
 
+    this.updateDocking();
+
     // Cursor highlighting is informational only — unlike tool targeting (currentTarget,
     // set in updateMining) it doesn't care what's selected or which mode the ship is in.
     this.hoverTarget = this.computeHoverTarget(worldMouse);
@@ -236,6 +254,11 @@ export class Engine {
     }
     const contacts = this.getContacts();
     for (const memory of this.discoveredContacts.values()) memory.age += dt;
+
+    // Home is never "discovered" — you always know where it is, unlike everything else on
+    // radar. Refreshed every frame so it never goes stale/forgotten the way a real discovery does.
+    const hubContact = this.hubContact();
+    this.discoveredContacts.set(hubContact.id, { contact: hubContact, age: 0 });
 
     if (this.pingActive) {
       this.pingRadius += PING_SPEED * dt;
@@ -317,7 +340,7 @@ export class Engine {
       const d = distance(chunk.pos, ship.pos);
       if (d < SHIP_RADIUS + CHUNK_COLLECT_RADIUS) {
         if (!ship.cargoFull) {
-          const taken = ship.addCargo(chunk.value);
+          const taken = ship.addCargo(chunk.composition, chunk.value);
           if (taken > 0) {
             this.setMessage(
               `+${taken} ${COMPOSITION_INFO[chunk.composition].label}`,
@@ -350,7 +373,7 @@ export class Engine {
 
   private handleShipDestroyed() {
     const lost = this.ship.cargoUsed;
-    this.ship.cargoUsed = 0;
+    this.ship.clearCargo();
     this.ship.hull = MAX_HULL;
     this.ship.pos = { ...SPAWN_POS };
     this.ship.vel = v2(0, 0);
@@ -359,6 +382,39 @@ export class Engine {
     this.anchoredCell = null;
     this.chunks = [];
     this.setMessage(lost > 0 ? `SHIP DESTROYED — ${lost} CARGO LOST` : "SHIP DESTROYED", "#ff5c5c");
+  }
+
+  /** The hub as a radar Contact — used to keep it permanently "known" (see the discovery
+   *  refresh in update()), not run through the normal ping/vision discovery gates everything
+   *  else on radar goes through. You always know where home is. */
+  private hubContact(): Contact {
+    return { id: "hub", kind: "hub", pos: this.hub.pos, radius: HUB_RADIUS, label: "Home Hub" };
+  }
+
+  /** Checked every frame while in the field — docking is a deliberate action (press F in
+   *  range), not automatic, so drifting near the hub mid-expedition doesn't interrupt anything. */
+  private updateDocking() {
+    const { ship, hub, input } = this;
+    this.nearHub = distance(ship.pos, hub.pos) <= HUB_DOCK_RANGE;
+    if (this.nearHub && input.wasJustPressed("f")) {
+      const deposited = ship.clearCargo();
+      hub.deposit(deposited);
+      this.scene = "hub";
+      this.setMessage("DOCKED", "#7de08d");
+    }
+  }
+
+  /** The hub screen is deliberately much simpler than the field update — no physics, no
+   *  mining, nothing at risk. Just launch back out when ready. */
+  private updateHub(dt: number) {
+    if (this.input.wasJustPressed("f")) {
+      this.scene = "field";
+      this.setMessage("LAUNCHED", "#7fe0ff");
+    }
+    if (this.message) {
+      this.message.timer -= dt;
+      if (this.message.timer <= 0) this.message = null;
+    }
   }
 
   /** Checks a circular body (ship or chunk) against every intact cell — not just whichever
