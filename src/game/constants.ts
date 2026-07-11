@@ -74,7 +74,9 @@ export const DRILL_ANCHOR_RANGE = 26; // max ship-to-surface distance to stay an
 // just to stay in range). Revisit with a relative-velocity check if needed.
 export const DRILL_ANCHOR_MAX_SPEED = 30; // px/s
 export const DRILL_SIG_PER_SEC = 15;
-export const DRILL_PROGRESS_DECAY = 0.6; // per second, when anchor conditions aren't met
+// Bore progress is persistent — once you've drilled into a section it stays put across
+// tool switches, flying off, and re-anchoring, only resetting when the section is fully
+// extracted (or fractured by other means).
 
 // Charges: place then remotely detonate; each detonated cell is extracted whole.
 export const CHARGE_RANGE = 150;

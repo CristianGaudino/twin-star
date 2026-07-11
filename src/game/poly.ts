@@ -234,3 +234,20 @@ export function closestPointOnPolygon(
 export function closestBoundaryPoint(poly: Polygon, from: Vec2): BoundaryHit | null {
   return closestPointOnPolygon(poly, from);
 }
+
+/** Pulls `target` back along the segment from `origin` (which must already be inside `poly`)
+ *  until it lands inside `poly`, backing off slightly from the exact crossing. Used to keep
+ *  procedurally generated detail confined to its own polygon — e.g. drill fractures growing
+ *  outward from a cell's centroid should never spill into a neighboring section or open space. */
+export function clampInsidePolygon(poly: Polygon, origin: Vec2, target: Vec2): Vec2 {
+  if (pointInPolygon(target, poly)) return target;
+  let lo = 0;
+  let hi = 1;
+  for (let i = 0; i < 20; i++) {
+    const mid = (lo + hi) / 2;
+    const p = add(origin, scale(sub(target, origin), mid));
+    if (pointInPolygon(p, poly)) lo = mid;
+    else hi = mid;
+  }
+  return add(origin, scale(sub(target, origin), lo * 0.92));
+}

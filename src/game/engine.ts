@@ -8,6 +8,7 @@ import { TOOLS, ToolId } from "./tools";
 import {
   BoundaryHit,
   boundingRadius,
+  clampInsidePolygon,
   closestBoundaryPoint,
   closestPointOnPolygon,
   pointInPolygon,
@@ -35,7 +36,6 @@ import {
   CONTACT_FORGET_AFTER,
   DRIFT_DAMPING,
   DRILL_ANCHOR_RANGE,
-  DRILL_PROGRESS_DECAY,
   DRILL_SIG_PER_SEC,
   LASER_CUT_DEPTH,
   LASER_SIG_PER_SEC,
@@ -260,15 +260,6 @@ export class Engine {
 
     this.activeBeam = null;
     this.updateMining(dt, worldMouse);
-
-    // Any cell mid-bore that isn't the one actively anchored right now erodes over
-    // time — whatever the reason drilling stopped (switched tools, flew off, aimed
-    // elsewhere), abandoning it should always bleed progress, not just while still
-    // hovering over it with the drill selected.
-    for (const cell of asteroid.cells) {
-      if (cell.fractured || cell.boreProgress <= 0 || cell === this.anchoredCell) continue;
-      cell.boreProgress = Math.max(0, cell.boreProgress - dt * DRILL_PROGRESS_DECAY);
-    }
 
     ship.decaySignature(dt, SIGNATURE_DECAY_PER_SEC);
 
@@ -890,8 +881,8 @@ export class Engine {
         ship.vel = v2(0, 0);
       }
 
-      if (boundary && (!validTarget.crackBranches || validTarget.boreProgress <= 0)) {
-        this.generateCrackBranches(validTarget, boundary.point);
+      if (!validTarget.crackBranches) {
+        this.generateCrackBranches(validTarget);
       }
 
       const info = COMPOSITION_INFO[validTarget.composition];
@@ -908,9 +899,8 @@ export class Engine {
       }
     } else {
       // Letting go — keep whatever momentum the rock had at that point (including
-      // its spin) rather than snapping to a dead stop. Bore progress itself now
-      // decays generically every frame (see update()) rather than only here, so
-      // abandoning a drill erodes it regardless of where the mouse ends up.
+      // its spin) rather than snapping to a dead stop. Bore progress is persistent
+      // and does not decay when the drill is released.
       if (releasingFrom) {
         const group = this.driftGroupOf(releasingFrom);
         if (group) {
@@ -923,25 +913,29 @@ export class Engine {
     }
   }
 
-  /** Generates a fixed set of jagged crack branches radiating from `originWorld` (the anchor
-   *  point), stored in the cell's own rotating local frame so they stay glued to that spot on
-   *  the rock as the piece drifts and spins — see `cellLocalToWorld`. Persists on the cell
-   *  itself, so it survives the piece being split into a different drift group. */
-  private generateCrackBranches(cell: Cell, originWorld: Vec2) {
-    const origin = cellWorldToLocal(cell, originWorld);
+  /** Generates a fixed set of jagged crack branches radiating outward from `originWorld`
+   *  (defaults to the cell's own centroid — see `runDrill`), stored in the cell's own rotating
+   *  local frame so they stay glued to their spot on the rock as the piece drifts and spins —
+   *  see `cellLocalToWorld`. Persists on the cell itself, so it survives the piece being split
+   *  into a different drift group. Every generated point is clamped to stay inside the cell's
+   *  own polygon (`clampInsidePolygon`), so fractures never visually spill into a neighboring
+   *  section or open space — kept general (any origin, any cause) so future sources besides
+   *  drilling (e.g. an impact) can raise fractures from their own point of contact too. */
+  private generateCrackBranches(cell: Cell, originWorld: Vec2 = cell.centroid) {
     const cellRadius = boundingRadius(cell.polygon, cell.centroid);
     const branchCount = 3 + Math.floor(Math.random() * 2);
     const branches: LocalPoint[][] = [];
     for (let i = 0; i < branchCount; i++) {
       let dir = (i / branchCount) * Math.PI * 2 + (Math.random() - 0.5) * 1.4;
       const segments = 2 + Math.floor(Math.random() * 2);
-      const points: LocalPoint[] = [origin];
-      let cur = origin;
+      let curWorld = originWorld;
+      const points: LocalPoint[] = [cellWorldToLocal(cell, curWorld)];
       for (let s = 0; s < segments; s++) {
         dir += (Math.random() - 0.5) * 0.9;
         const segLen = (cellRadius / segments) * (0.55 + Math.random() * 0.5);
-        cur = { a: cur.a + Math.cos(dir) * segLen, b: cur.b + Math.sin(dir) * segLen };
-        points.push(cur);
+        const candidate = add(curWorld, fromAngle(dir, segLen));
+        curWorld = clampInsidePolygon(cell.polygon, curWorld, candidate);
+        points.push(cellWorldToLocal(cell, curWorld));
       }
       branches.push(points);
     }
