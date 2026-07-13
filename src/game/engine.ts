@@ -1,10 +1,20 @@
 import { InputState } from "./input";
 import { DamageSource, Ship } from "./ship";
-import { ASTEROID_ARCHETYPES, Asteroid, Cell, COMPOSITION_INFO, CrackSegment, cellWorldToLocal } from "./asteroid";
+import {
+  ASTEROID_ARCHETYPES,
+  Asteroid,
+  Cell,
+  COMPOSITION_INFO,
+  CrackSegment,
+  cellWorldToLocal,
+  scanSecondsForRadius,
+  sizeLabelForRadius,
+} from "./asteroid";
 import { BodyHandle } from "./body";
 import { Chunk } from "./chunk";
-import { Contact, ContactMemory } from "./contacts";
+import { Contact, ContactKind, ContactMemory } from "./contacts";
 import { Explosion } from "./explosion";
+import { GravitySource, gravityAccel, radiantHeatExposure } from "./gravity";
 import { HoverTarget } from "./hover";
 import { Hub } from "./hub";
 import { TOOLS, ToolId } from "./tools";
@@ -27,8 +37,12 @@ import {
   ANGULAR_DAMPING,
   ASTEROID_SIZE_CLASSES,
   BELT_ASTEROID_COUNT,
+  BELT_DRIFT_CHANCE,
+  BELT_DRIFT_SPEED,
   BELT_INNER_RADIUS,
   BELT_OUTER_RADIUS,
+  BELT_SIZE_POOL,
+  BELT_TINY_ROCK_COUNT,
   BLAST_VISUAL_DURATION,
   CELL_TOUCH_EPSILON,
   CHARGE_BLAST_DAMAGE_MAX,
@@ -42,9 +56,16 @@ import {
   CHUNK_RESTITUTION,
   COLLISION_SUBSTEP_TRAVEL,
   CONTACT_FORGET_AFTER,
+  CONTACT_MAX_RANGE,
+  DEATH_SCREEN_DURATION,
   DRIFT_DAMPING,
   DRILL_ANCHOR_RANGE,
   DRILL_FRACTURE_GENERATIONS,
+  HOME_STAR_HEAT_INTENSITY,
+  HOME_STAR_POS,
+  HOME_STAR_PULL_RADIUS,
+  HOME_STAR_PULL_STRENGTH,
+  HOME_STAR_RADIUS,
   HOVER_CHUNK_PADDING,
   HUB_DOCK_RANGE,
   HUB_RADIUS,
@@ -52,6 +73,13 @@ import {
   MAX_COLLISION_SUBSTEPS,
   MAX_HULL,
   MIN_CELL_AREA,
+  NEAR_HUB_ROCK_COUNT,
+  NEAR_HUB_ROCK_RADIUS,
+  NORMAL_AREA_ASTEROID_COUNT,
+  NORMAL_AREA_INNER_RADIUS,
+  NORMAL_AREA_OUTER_RADIUS,
+  NORMAL_AREA_SIZE_POOL,
+  NORMAL_AREA_TINY_ROCK_COUNT,
   PING_COOLDOWN,
   PING_MAX_RADIUS,
   PING_SPEED,
@@ -60,7 +88,6 @@ import {
   ROCK_FRICTION,
   ROCK_MASS_PER_AREA,
   ROCK_RESTITUTION,
-  SCAN_HOLD_SECONDS,
   SCAN_PROGRESS_DECAY,
   SCAN_RANGE,
   SHIP_FRICTION,
@@ -68,6 +95,9 @@ import {
   SHIP_RADIUS,
   SHIP_RESTITUTION,
   SIGNATURE_DECAY_PER_SEC,
+  TEMPERATURE_DAMAGE_THRESHOLD,
+  TEMPERATURE_MAX_DAMAGE_PER_SEC,
+  TINY_ROCK_RADIUS,
   TOOL_OFF_MULT,
   TOOL_RECOMMENDED_MULT,
   VISION_RADIUS,
@@ -123,6 +153,10 @@ export class Engine {
   chunks: Chunk[] = [];
   input: InputState;
   nearestAsteroid: Asteroid | null = null; // read by Renderer for scan-data HUD; updated every field frame
+  // Localized gravity wells around specific big bodies (see gravity.ts) — the home star today,
+  // a planet/moon/the far star just another entry here later. Read by Renderer for the
+  // pull-radius warning ring.
+  gravitySources: GravitySource[] = [];
 
   paused = false;
   // "field" is everything that exists today; "hub" is a distinct, much simpler screen — see
@@ -135,9 +169,18 @@ export class Engine {
   pingRadius = 0;
   pingCooldown = 0;
   discoveredContacts = new Map<string, ContactMemory>(); // read by Renderer for radar blips
+  // A contact's *identity* (what it actually is), separate from just knowing it's out there —
+  // only populated by real close-range vision, never by ping alone (see update()'s sensor
+  // block), and never removed once set: having actually seen something isn't something you
+  // forget just because you've since lost track of where it is.
+  identifiedContacts = new Set<string>();
 
   message: FlashMessage | null = null;
   private cargoFullMessageCooldown = 0;
+  // A dedicated overlay for "you died," separate from the transient flash-message system —
+  // read by Renderer, auto-dismisses on its own timer rather than needing a keypress (death
+  // costs a run's haul, not the session, per spec — it shouldn't feel like a hard stop).
+  deathScreen: { cause: string; cargoLost: number; timer: number } | null = null;
 
   activeBeam: { from: Vec2; to: Vec2; tool: ToolId } | null = null;
   currentTarget: Cell | null = null; // tool-specific: range/mode-gated, drives actual mining behavior
@@ -150,37 +193,119 @@ export class Engine {
   // rotation) happens to bring it back within tolerance a frame later. Without this, a gap
   // sitting near the touch threshold can flicker connected/disconnected forever.
   private severedEdges = new Set<string>();
+  // Rebuilt every recomputeDriftGroups call — O(1) lookup for driftGroupOf instead of a linear
+  // scan over every group's cells on every call.
+  private cellGroupMap = new Map<number, DriftGroup>();
+  // Recomputed once per frame (see computeDriftGroupBounds) — shared by resolveGroupCollisions
+  // and getContacts so both read the same center-of-mass/bounding-radius work instead of each
+  // independently recomputing it.
+  private driftGroupBounds: { group: DriftGroup; com: Vec2; radius: number }[] = [];
 
   private width = 0;
   private height = 0;
 
   constructor(canvas: HTMLCanvasElement) {
     this.input = new InputState(canvas);
-    this.ship = new Ship(SPAWN_POS);
+    // TEMP: spawning inside the (now star-anchored) belt ring on request, just to look at it —
+    // hub stays put. Revert to `new Ship(SPAWN_POS)` when done.
+    this.ship = new Ship(add(HOME_STAR_POS, fromAngle(-Math.PI / 2, (BELT_INNER_RADIUS + BELT_OUTER_RADIUS) / 2)));
     this.hub = new Hub({ ...SPAWN_POS });
-    this.asteroids = this.scatterBelt();
+    this.asteroids = this.scatterSystem();
+    this.gravitySources = [
+      {
+        id: "home-star",
+        kind: "star",
+        pos: HOME_STAR_POS,
+        radius: HOME_STAR_RADIUS,
+        pullRadius: HOME_STAR_PULL_RADIUS,
+        pullStrength: HOME_STAR_PULL_STRENGTH,
+        lethal: true,
+        // Shares the pull radius — if you're being pulled in, you're already in the heat too.
+        heatRadius: HOME_STAR_PULL_RADIUS,
+        heatIntensity: HOME_STAR_HEAT_INTENSITY,
+      },
+    ];
   }
 
-  /** Scatters the starting belt around the hub (the fixed landmark is the belt's own
-   *  inner/outer radius — see constants.ts; what's placed inside it is procedural content).
-   *  Biased toward the inner edge (`Math.random() ** 2`) rather than uniform across the
-   *  annulus, so the belt reads as denser near home with a sparser tail reaching all the way
-   *  out, instead of every asteroid being equally likely to spawn at the far edge. */
-  private scatterBelt(): Asteroid[] {
+  /** Scatters every procedural asteroid in the system — three distinct populations, not one
+   *  homogeneous scatter (see constants.ts for the reasoning behind each):
+   *  - **The belt**: a real ring around the *star* (`BELT_INNER_RADIUS`/`BELT_OUTER_RADIUS`),
+   *    dense, skewed toward its own larger size classes — the landmark you travel to reach.
+   *  - **Normal space**: also star-anchored, filling the gap between the safe zone and the
+   *    belt's inner edge — moderate density, skewed toward smaller classes, so there's real
+   *    reason to mine on the way out without competing with the belt as the destination.
+   *  - **Near-hub boulders**: still hub-relative (unlike the other two) — a small guaranteed
+   *    population right outside the hub regardless of where the belt/normal-area randomness
+   *    happens to land, so undocking never means "immediately nothing to do."
+   *  All three place bodies uniformly across their own distance band (no inner-edge bias) — the
+   *  earlier hub-wide annulus needed that bias to taper across a single huge span; three
+   *  separate, deliberately-sized bands don't. */
+  private scatterSystem(): Asteroid[] {
     const asteroids: Asteroid[] = [];
+    const beltRange = { min: BELT_INNER_RADIUS, max: BELT_OUTER_RADIUS };
+    const normalRange = { min: NORMAL_AREA_INNER_RADIUS, max: NORMAL_AREA_OUTER_RADIUS };
+
     for (let i = 0; i < BELT_ASTEROID_COUNT; i++) {
-      const angle = Math.random() * Math.PI * 2;
-      const t = Math.random() ** 2;
-      const dist = BELT_INNER_RADIUS + t * (BELT_OUTER_RADIUS - BELT_INNER_RADIUS);
-      const center = add(this.hub.pos, fromAngle(angle, dist));
+      const sizeClass = ASTEROID_SIZE_CLASSES[BELT_SIZE_POOL[Math.floor(Math.random() * BELT_SIZE_POOL.length)]];
+      asteroids.push(this.spawnSystemBody(sizeClass.min, sizeClass.max, { origin: HOME_STAR_POS, distRange: beltRange }));
+    }
+    for (let i = 0; i < BELT_TINY_ROCK_COUNT; i++) {
+      asteroids.push(
+        this.spawnSystemBody(TINY_ROCK_RADIUS.min, TINY_ROCK_RADIUS.max, {
+          seedCount: 1,
+          origin: HOME_STAR_POS,
+          distRange: beltRange,
+        }),
+      );
+    }
 
-      const sizeClass = ASTEROID_SIZE_CLASSES[Math.floor(Math.random() * ASTEROID_SIZE_CLASSES.length)];
-      const radius = sizeClass.min + Math.random() * (sizeClass.max - sizeClass.min);
-      const compositionWeights = ASTEROID_ARCHETYPES[Math.floor(Math.random() * ASTEROID_ARCHETYPES.length)];
+    for (let i = 0; i < NORMAL_AREA_ASTEROID_COUNT; i++) {
+      const sizeClass =
+        ASTEROID_SIZE_CLASSES[NORMAL_AREA_SIZE_POOL[Math.floor(Math.random() * NORMAL_AREA_SIZE_POOL.length)]];
+      asteroids.push(this.spawnSystemBody(sizeClass.min, sizeClass.max, { origin: HOME_STAR_POS, distRange: normalRange }));
+    }
+    for (let i = 0; i < NORMAL_AREA_TINY_ROCK_COUNT; i++) {
+      asteroids.push(
+        this.spawnSystemBody(TINY_ROCK_RADIUS.min, TINY_ROCK_RADIUS.max, {
+          seedCount: 1,
+          origin: HOME_STAR_POS,
+          distRange: normalRange,
+        }),
+      );
+    }
 
-      asteroids.push(new Asteroid(center, Math.random, { radius, compositionWeights }));
+    for (let i = 0; i < NEAR_HUB_ROCK_COUNT; i++) {
+      asteroids.push(
+        this.spawnSystemBody(TINY_ROCK_RADIUS.min, TINY_ROCK_RADIUS.max, {
+          seedCount: 1,
+          origin: this.hub.pos,
+          distRange: NEAR_HUB_ROCK_RADIUS,
+        }),
+      );
     }
     return asteroids;
+  }
+
+  private spawnSystemBody(
+    minRadius: number,
+    maxRadius: number,
+    options: { seedCount?: number; distRange: { min: number; max: number }; origin: Vec2 },
+  ): Asteroid {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = options.distRange.min + Math.random() * (options.distRange.max - options.distRange.min);
+    const center = add(options.origin, fromAngle(angle, dist));
+
+    const radius = minRadius + Math.random() * (maxRadius - minRadius);
+    const compositionWeights = ASTEROID_ARCHETYPES[Math.floor(Math.random() * ASTEROID_ARCHETYPES.length)];
+
+    // Most bodies start fully at rest — a fraction get a small initial drift instead, just
+    // enough that the field doesn't read as a frozen diagram.
+    const initialVelocity =
+      Math.random() < BELT_DRIFT_CHANCE
+        ? fromAngle(Math.random() * Math.PI * 2, BELT_DRIFT_SPEED.min + Math.random() * (BELT_DRIFT_SPEED.max - BELT_DRIFT_SPEED.min))
+        : undefined;
+
+    return new Asteroid(center, Math.random, { radius, compositionWeights, seedCount: options.seedCount, initialVelocity });
   }
 
   dispose() {
@@ -229,6 +354,12 @@ export class Engine {
     // contacts are settled before the ship reacts to the resulting positions.
     this.recomputeDriftGroups();
     this.updateDriftGroups(dt);
+    this.destroyGroupsInLethalContact();
+    // Computed once here — cell positions are settled for the rest of this frame (nothing after
+    // this moves them again until next frame's updateDriftGroups), so both resolveGroupCollisions
+    // and getContacts (in the sensor block below) can share this instead of each recomputing
+    // every group's center of mass and bounding radius independently.
+    this.computeDriftGroupBounds();
     this.resolveGroupCollisions(dt);
 
     // Substepped so a fast frame (cruise top speed, or right after a hard hit) can't skip
@@ -237,8 +368,33 @@ export class Engine {
     const shipSteps = this.substepsFor(length(ship.vel), dt);
     const shipSubDt = dt / shipSteps;
     for (let s = 0; s < shipSteps; s++) {
+      this.applyGravityTo(ship, shipSubDt);
       const stepMouse = this.screenToWorld(input.mouseScreen);
       ship.updateMovement(shipSubDt, input, stepMouse);
+      if (this.lethalGravityContact(ship.pos)) {
+        this.handleShipDestroyed("PULLED INTO THE STAR");
+        break;
+      }
+
+      // Heat is a two-stage threat from the same wells: exposure always raises temperature (a
+      // visible warning — see Ship.temperature), but only once temperature crosses
+      // TEMPERATURE_DAMAGE_THRESHOLD does it actually start costing hull, escalating toward
+      // TEMPERATURE_MAX_DAMAGE_PER_SEC at full overheat. Touching the surface is still
+      // unconditionally instant death regardless of temperature — this is a separate, gentler
+      // threat for lingering nearby, not a replacement for it.
+      const exposure = this.totalRadiantHeatExposure(ship.pos);
+      const wasOverheating = ship.temperature > TEMPERATURE_DAMAGE_THRESHOLD;
+      ship.updateTemperature(exposure, shipSubDt);
+      if (ship.temperature > TEMPERATURE_DAMAGE_THRESHOLD) {
+        if (!wasOverheating) this.setMessage("HULL TEMPERATURE CRITICAL", "#ff8f6b");
+        const overheatFrac = (ship.temperature - TEMPERATURE_DAMAGE_THRESHOLD) / (100 - TEMPERATURE_DAMAGE_THRESHOLD);
+        ship.takeImpact(overheatFrac * TEMPERATURE_MAX_DAMAGE_PER_SEC * shipSubDt, "heat");
+        if (ship.hull <= 0) {
+          this.handleShipDestroyed("BURNED UP");
+          break;
+        }
+      }
+
       const result = this.resolveBodyVsRock(this.shipBody(), shipSubDt);
       if (result) this.reactToCollision(result.kind, "rock", result.closingSpeed);
     }
@@ -265,8 +421,10 @@ export class Engine {
     const contacts = this.getContacts();
     for (const memory of this.discoveredContacts.values()) memory.age += dt;
 
-    // Home is never "discovered" — you always know where it is, unlike everything else on
-    // radar. Refreshed every frame so it never goes stale/forgotten the way a real discovery does.
+    // Home itself is the one exception — never "discovered," you always know where the hub is,
+    // unlike everything else on radar (including the star and every other gravity source,
+    // which now go through the normal ping/vision discovery below like any other contact).
+    // Refreshed every frame so it never goes stale/forgotten the way a real discovery does.
     const hubContact = this.hubContact();
     this.discoveredContacts.set(hubContact.id, { contact: hubContact, age: 0 });
 
@@ -288,13 +446,42 @@ export class Engine {
       }
       if (this.pingRadius > PING_MAX_RADIUS) this.pingActive = false;
     }
+    // Passive close-range detection — a proximity sensor, not eyes: refreshes position
+    // knowledge for anything nearby regardless of whether it's actually in view right now.
     for (const contact of contacts) {
       if (distance(ship.pos, contact.pos) - contact.radius < VISION_RADIUS) {
         this.discoveredContacts.set(contact.id, { contact, age: 0 });
       }
     }
+    // Identification is different — it means having actually seen the thing, so unlike passive
+    // detection above it requires it to genuinely be on screen right now, not just within an
+    // abstract sensor radius (VISION_RADIUS can exceed half the viewport, which was letting
+    // things get "identified" while still well off camera).
+    const camOffset = sub(ship.pos, v2(this.width / 2, this.height / 2));
+    for (const contact of contacts) {
+      const screenPos = sub(contact.pos, camOffset);
+      const onScreen =
+        screenPos.x + contact.radius >= 0 &&
+        screenPos.x - contact.radius <= this.width &&
+        screenPos.y + contact.radius >= 0 &&
+        screenPos.y - contact.radius <= this.height;
+      if (onScreen) this.identifiedContacts.add(contact.id);
+    }
+    // Forgotten for any of three reasons: it's simply gone stale (nothing's refreshed it in a
+    // while), the ship is too far from where it was last seen (a ping is a local snapshot, not
+    // a permanent mark), or — unlike either of those, which are about *our* knowledge going
+    // stale — the thing itself no longer exists at all (mined out, destroyed). `getContacts()`
+    // always lists every rock body currently alive anywhere in the world, not just nearby ones,
+    // so "not in this frame's contacts" reliably means gone, not just out of range; without this
+    // a fully-mined asteroid's radar blip would otherwise linger for up to CONTACT_FORGET_AFTER
+    // seconds after the last cell was extracted, same as any other memory going stale. The hub
+    // is the sole exception to all three, refreshed unconditionally above.
+    const liveContactIds = new Set(contacts.map((c) => c.id));
     for (const [id, memory] of this.discoveredContacts) {
-      if (memory.age > CONTACT_FORGET_AFTER) this.discoveredContacts.delete(id);
+      if (id === hubContact.id) continue;
+      const gone = !liveContactIds.has(id);
+      const tooFar = distance(ship.pos, memory.contact.pos) > CONTACT_MAX_RANGE;
+      if (gone || memory.age > CONTACT_FORGET_AFTER || tooFar) this.discoveredContacts.delete(id);
     }
 
     // --- scan: hold E in range while a wave sweeps outward from the nearest asteroid ---
@@ -306,7 +493,8 @@ export class Engine {
       const surfaceDist = distance(ship.pos, scanTarget.center) - scanTarget.outerRadius;
       const canScan = surfaceDist <= SCAN_RANGE;
       if (canScan && input.isDown("e")) {
-        scanTarget.scanProgress = Math.min(1, scanTarget.scanProgress + dt / SCAN_HOLD_SECONDS);
+        const scanSeconds = scanSecondsForRadius(scanTarget.outerRadius);
+        scanTarget.scanProgress = Math.min(1, scanTarget.scanProgress + dt / scanSeconds);
         if (scanTarget.scanProgress >= 1) {
           scanTarget.scanned = true;
           this.setMessage("ASTEROID SCANNED — see SCAN DATA panel", "#7fe0ff");
@@ -342,7 +530,10 @@ export class Engine {
     const chunkSteps = this.substepsFor(fastestChunk, dt);
     const chunkSubDt = dt / chunkSteps;
     for (let s = 0; s < chunkSteps; s++) {
-      for (const chunk of this.chunks) chunk.update(chunkSubDt);
+      for (const chunk of this.chunks) {
+        this.applyGravityTo(chunk, chunkSubDt);
+        chunk.update(chunkSubDt);
+      }
       for (const chunk of this.chunks) {
         const result = this.resolveBodyVsRock(this.chunkBody(chunk), chunkSubDt);
         if (result) this.reactToCollision(result.kind, "rock", result.closingSpeed);
@@ -351,6 +542,8 @@ export class Engine {
     this.resolveCircleCollisions(dt); // chunk-chunk + chunk-ship, one generic sweep
 
     this.chunks = this.chunks.filter((chunk) => {
+      if (this.lethalGravityContact(chunk.pos)) return false; // drifted into a lethal body — lost
+
       const d = distance(chunk.pos, ship.pos);
       if (d < SHIP_RADIUS + CHUNK_COLLECT_RADIUS) {
         if (!ship.cargoFull) {
@@ -374,6 +567,10 @@ export class Engine {
       this.message.timer -= dt;
       if (this.message.timer <= 0) this.message = null;
     }
+    if (this.deathScreen) {
+      this.deathScreen.timer -= dt;
+      if (this.deathScreen.timer <= 0) this.deathScreen = null;
+    }
 
     if (ship.hull <= 0) this.handleShipDestroyed();
 
@@ -385,17 +582,68 @@ export class Engine {
     this.ship.selectedTool = TOOL_ORDER[(idx + 1) % TOOL_ORDER.length];
   }
 
-  private handleShipDestroyed() {
+  /** `cause` lets whatever killed the ship say so (e.g. gravity) instead of a generic message —
+   *  DamageSource already tags *why* a hit happened; this is the same idea for the death screen. */
+  private handleShipDestroyed(cause = "SHIP DESTROYED") {
     const lost = this.ship.cargoUsed;
     this.ship.clearCargo();
     this.ship.hull = MAX_HULL;
+    this.ship.temperature = 0;
     this.ship.pos = { ...SPAWN_POS };
     this.ship.vel = v2(0, 0);
     this.ship.chargesCarried = CHARGE_MAX_CARRIED;
     this.ship.anchored = false;
     this.anchoredCell = null;
     this.chunks = [];
-    this.setMessage(lost > 0 ? `SHIP DESTROYED — ${lost} CARGO LOST` : "SHIP DESTROYED", "#ff5c5c");
+    // Radar reflects what you currently know, not a permanent record — respawning back at the
+    // hub with zero sensor contact on anything out in the field should read that way, not carry
+    // over blips from wherever the ship just died. The hub itself needs no special-casing here:
+    // it's refreshed unconditionally every frame regardless of this map's contents (see update()).
+    this.discoveredContacts.clear();
+    this.deathScreen = { cause, cargoLost: lost, timer: DEATH_SCREEN_DURATION };
+  }
+
+  /** Applies every gravity source's pull to any mover with a position/velocity — the ship, a
+   *  chunk, or a drift group's own center of mass (see updateDriftGroups), all through this one
+   *  path. Still not real orbital mechanics for the whole belt (no per-body orbit is computed
+   *  or maintained) — bodies simply feel the same local pull everything else does, and mostly
+   *  never get close enough to a well to notice, since the belt's inner edge sits outside the
+   *  home star's pull radius entirely. */
+  private applyGravityTo(mover: { pos: Vec2; vel: Vec2 }, dt: number) {
+    for (const source of this.gravitySources) {
+      const accel = gravityAccel(source, mover.pos);
+      mover.vel = add(mover.vel, scale(accel, dt));
+    }
+  }
+
+  /** Whether `pos` has crossed into a lethal gravity source's physical surface — the pull alone
+   *  doesn't hurt you, touching what's pulling you does. */
+  private lethalGravityContact(pos: Vec2): boolean {
+    return this.gravitySources.some((source) => source.lethal && distance(pos, source.pos) <= source.radius);
+  }
+
+  /** A drift group that's fallen into a lethal body is simply consumed — every cell in it is
+   *  marked fractured (same as a normal extraction) but with no `spawnChunk` call, so nothing
+   *  drops. `recomputeDriftGroups` picks up the now-all-fractured group as gone on its own next
+   *  frame, the same way it already handles any other cell being fractured. */
+  private destroyGroupsInLethalContact() {
+    for (const group of this.driftGroups) {
+      const doomed = group.cells.some((cell) => this.lethalGravityContact(cell.centroid));
+      if (!doomed) continue;
+      for (const cell of group.cells) {
+        cell.fractured = true;
+        cell.hasCharge = false;
+      }
+    }
+  }
+
+  /** Summed thermal exposure from every gravity source at `pos` — more than one overlapping
+   *  well (a future close binary, say) just adds up. Feeds Ship.temperature, not hull damage
+   *  directly — see the ship substep loop for the warning-then-damage conversion. */
+  private totalRadiantHeatExposure(pos: Vec2): number {
+    let total = 0;
+    for (const source of this.gravitySources) total += radiantHeatExposure(source, pos);
+    return total;
   }
 
   /** The hub as a radar Contact — used to keep it permanently "known" (see the discovery
@@ -403,6 +651,22 @@ export class Engine {
    *  else on radar goes through. You always know where home is. */
   private hubContact(): Contact {
     return { id: "hub", kind: "hub", pos: this.hub.pos, radius: HUB_RADIUS, label: "Home Hub" };
+  }
+
+  /** A gravity source (the star today) as a radar Contact — goes through the normal ping/vision
+   *  discovery gate in `getContacts()` like any other contact, not the hub's always-known
+   *  treatment; a landmark being fixed in place doesn't mean you already know it's there.
+   *  `kind` is cast since `GravitySource` intentionally keeps its own `kind` as a free-form
+   *  string (nothing else about gravity cares what it's labeled) while `ContactKind` is a
+   *  closed union radar rendering switches on. */
+  private gravitySourceContact(source: GravitySource): Contact {
+    return {
+      id: source.id,
+      kind: source.kind as ContactKind,
+      pos: source.pos,
+      radius: source.radius,
+      label: source.kind === "star" ? "Home Star" : source.kind,
+    };
   }
 
   /** Checked every frame while in the field — docking is a deliberate action (press F in
@@ -711,11 +975,30 @@ export class Engine {
 
   /** Rock-vs-rock: separate drift groups now collide with each other instead of passing through.
    *  Broad+narrow phase in one pass, approximating each cell as a circle (cells are small and
-   *  roughly convex, so this is close enough without full polygon-polygon SAT). */
+   *  roughly convex, so this is close enough without full polygon-polygon SAT).
+   *
+   *  Group-level bounding-circle reject happens *here*, once per group per frame, before any
+   *  pair is even considered — without it, every one of the O(n^2) group pairs ran a full
+   *  per-cell double loop regardless of whether the two bodies were anywhere near each other
+   *  (two asteroids on opposite sides of the belt still paid full price). Fine at the old ~46-body
+   *  count; with the belt redesign roughly doubling body count (quadrupling the O(n^2) pair
+   *  count) and skewing toward larger, more-celled bodies, this was the actual cause of a real
+   *  frame-rate regression, not just a theoretical inefficiency. */
+  private computeDriftGroupBounds() {
+    this.driftGroupBounds = this.driftGroups.map((group) => {
+      const com = this.groupCenterOfMass(group.cells);
+      return { group, com, radius: this.groupBoundingRadius(group, com) };
+    });
+  }
+
   private resolveGroupCollisions(dt: number) {
-    for (let i = 0; i < this.driftGroups.length; i++) {
-      for (let j = i + 1; j < this.driftGroups.length; j++) {
-        this.resolveGroupPair(this.driftGroups[i], this.driftGroups[j], dt);
+    const bounds = this.driftGroupBounds;
+    for (let i = 0; i < bounds.length; i++) {
+      for (let j = i + 1; j < bounds.length; j++) {
+        const a = bounds[i];
+        const b = bounds[j];
+        if (distance(a.com, b.com) - a.radius - b.radius > CELL_TOUCH_EPSILON) continue;
+        this.resolveGroupPair(a.group, b.group, dt);
       }
     }
   }
@@ -730,10 +1013,11 @@ export class Engine {
     let bestA: Cell | null = null;
     let bestB: Cell | null = null;
 
+    // Precomputed once per cellB rather than recomputed on every cellA iteration.
+    const bCells = groupB.cells.map((cell) => ({ cell, r: boundingRadius(cell.polygon, cell.centroid) }));
     for (const cellA of groupA.cells) {
       const rA = boundingRadius(cellA.polygon, cellA.centroid);
-      for (const cellB of groupB.cells) {
-        const rB = boundingRadius(cellB.polygon, cellB.centroid);
+      for (const { cell: cellB, r: rB } of bCells) {
         const centroidDist = distance(cellA.centroid, cellB.centroid);
         if (centroidDist - rA - rB > CELL_TOUCH_EPSILON) continue; // circles alone rule this out
         const gap = polygonMinDistance(cellA.polygon, cellB.polygon);
@@ -844,20 +1128,23 @@ export class Engine {
     return Math.max(10, maxR);
   }
 
-  /** Every currently-trackable thing in the world, for ping/radar. Rock pieces are the only
-   *  kind today — other asteroids, ships, drones, enemies, and satellites should plug in here
-   *  the same way once they exist, rather than ping/radar needing new special-case code. */
+  /** Every currently-trackable thing in the world, for ping/radar — rock pieces and gravity
+   *  sources (the star today, a planet later) alike. Everything here goes through the same
+   *  discovery gate (ping sweep or passive vision range) and the same staleness/forgetting —
+   *  a landmark being fixed in place doesn't make it any less something you have to actually
+   *  find first; only the hub (home base, always known) is exempt from that. */
   getContacts(): Contact[] {
-    return this.driftGroups.map((group) => {
-      const com = this.groupCenterOfMass(group.cells);
+    const rockContacts: Contact[] = this.driftGroupBounds.map(({ group, com, radius }) => {
       return {
         id: `rock-${group.id}`,
         kind: "rock" as const,
         pos: com,
-        radius: this.groupBoundingRadius(group, com),
-        label: "Rock Mass",
+        radius,
+        label: `${sizeLabelForRadius(radius)} Asteroid`,
       };
     });
+    const gravityContacts = this.gravitySources.map((source) => this.gravitySourceContact(source));
+    return [...rockContacts, ...gravityContacts];
   }
 
   /** Recomputes which clusters of intact cells are still connected to their parent mass.
@@ -866,12 +1153,35 @@ export class Engine {
    *  (each one's Voronoi tessellation is its own graph — cells from different asteroids are
    *  never neighbors), but cell ids are globally unique across every asteroid, so their
    *  adjacency maps merge into one without collisions and every asteroid's cells feed the same
-   *  flat list of drift groups. */
+   *  flat list of drift groups.
+   *
+   *  Also keeps `Asteroid.center` itself live — it started as just the fixed spawn point, which
+   *  went stale the moment a whole (never-split) body drifted under gravity: nearest-asteroid
+   *  selection, scan range gating, and the scan sweep visual all read `asteroid.center` as "where
+   *  this body currently is," so a frozen value meant the scan circle visibly stopped following
+   *  a moving rock. Recomputed here (mass-weighted centroid of the asteroid's own intact cells)
+   *  since this loop already walks every cell once per frame regardless — no new pass needed.
+   *  Known gap: if a body has split into more than one drift group without being scanned yet,
+   *  this averages across all of them, which isn't any single piece's real position — not
+   *  handled, revisit if it turns out to matter in practice. */
   private recomputeDriftGroups() {
     const intact: Cell[] = [];
     const neighbors = new Map<number, number[]>();
+    const cellOrigin = new Map<number, Asteroid>(); // only needed to seed a fresh group's initial drift
     for (const asteroid of this.asteroids) {
-      for (const cell of asteroid.cells) if (!cell.fractured) intact.push(cell);
+      let sumX = 0;
+      let sumY = 0;
+      let totalMass = 0;
+      for (const cell of asteroid.cells) {
+        if (cell.fractured) continue;
+        intact.push(cell);
+        cellOrigin.set(cell.id, asteroid);
+        const m = polygonArea(cell.polygon);
+        sumX += cell.centroid.x * m;
+        sumY += cell.centroid.y * m;
+        totalMass += m;
+      }
+      if (totalMass > 1e-6) asteroid.center = v2(sumX / totalMass, sumY / totalMass);
       for (const [id, list] of asteroid.neighbors) neighbors.set(id, list);
     }
     if (intact.length === 0) {
@@ -938,7 +1248,10 @@ export class Engine {
 
     this.driftGroups = matches.map(({ comp, prev }) => {
       if (isInitial) {
-        return { id: nextGroupId++, cells: comp, vel: v2(0, 0), angularVelocity: 0 };
+        // Whole, never-yet-touched bodies start with whatever drift their source Asteroid was
+        // given at scatter time (see scatterBelt) — most are zero, a fraction aren't.
+        const vel = cellOrigin.get(comp[0].id)?.initialVelocity ?? v2(0, 0);
+        return { id: nextGroupId++, cells: comp, vel, angularVelocity: 0 };
       }
       const isFreshSplit = !prev || (claimCount.get(prev) ?? 0) > 1;
       if (!isFreshSplit && prev) {
@@ -961,13 +1274,29 @@ export class Engine {
       const vel = velocityAtPoint(prev.vel, prev.angularVelocity, sub(newCom, parentCom));
       return { id: nextGroupId++, cells: comp, vel, angularVelocity: prev.angularVelocity };
     });
+
+    // O(1) lookup for driftGroupOf below — without this it was a linear scan over every group's
+    // every cell (`driftGroups.find(g => g.cells.includes(cell))`), paid on every call. Cheap to
+    // rebuild here since this function already visits every cell once regardless.
+    this.cellGroupMap.clear();
+    for (const group of this.driftGroups) {
+      for (const cell of group.cells) this.cellGroupMap.set(cell.id, group);
+    }
   }
 
   private updateDriftGroups(dt: number) {
     for (const group of this.driftGroups) {
+      const com = this.groupCenterOfMass(group.cells);
+
+      // Rocks feel gravity too — same wells as the ship/chunks (see applyGravityTo), computed
+      // before the at-rest early-continue below so a stationary body near a massive one
+      // actually starts moving instead of being exempt just because nothing had hit it yet.
+      const mover = { pos: com, vel: group.vel };
+      this.applyGravityTo(mover, dt);
+      group.vel = mover.vel;
+
       if (Math.abs(group.angularVelocity) < 1e-5 && length(group.vel) < 1e-5) continue;
 
-      const com = this.groupCenterOfMass(group.cells);
       const dAngle = group.angularVelocity * dt;
       const dPos = scale(group.vel, dt);
       for (const cell of group.cells) {
@@ -982,7 +1311,7 @@ export class Engine {
   }
 
   private driftGroupOf(cell: Cell): DriftGroup | undefined {
-    return this.driftGroups.find((g) => g.cells.includes(cell));
+    return this.cellGroupMap.get(cell.id);
   }
 
   /** Whatever's directly under the cursor, checked closest-first (a chunk sitting on top of
@@ -1097,6 +1426,11 @@ export class Engine {
     for (const asteroid of this.asteroids) {
       for (const cell of asteroid.cells) {
         if (cell.fractured) continue;
+        // Same cheap reject as findCellContact — DRILL_ANCHOR_RANGE is tiny (a few px), so
+        // without this every intact cell in the whole belt gets an exact boundary query every
+        // frame the drill is selected, no matter how far away it actually is.
+        const roughReach = boundingRadius(cell.polygon, cell.centroid) + bestDist;
+        if (distance(cell.centroid, this.ship.pos) > roughReach) continue;
         const mask = this.exposedEdgeMask(cell);
         const boundary = closestPointOnPolygon(cell.polygon, this.ship.pos, (i) => mask[i]);
         if (!boundary || boundary.distance > bestDist) continue;

@@ -6,6 +6,8 @@ import {
   MAX_HULL,
   RCS_DRAG,
   SHIP_THRUST_ACCEL,
+  TEMPERATURE_DECAY_PER_SEC,
+  TEMPERATURE_RISE_PER_HEAT_UNIT,
 } from "./constants";
 import { CHARGE_MAX_CARRIED } from "./constants";
 import { Composition } from "./asteroid";
@@ -22,10 +24,10 @@ export type MoveMode = "cruise" | "rcs";
 
 /** What caused a hit — required on every `takeImpact` call so future sources (enemy weapons,
  *  hazards) can't silently skip tagging themselves, the same way `Explosion.source` is required.
- *  Not consumed anywhere yet beyond being available; exists so per-source feedback (distinct hit
- *  messages/sounds/flashes) has something to switch on once combat lands instead of needing a
- *  retrofit across every call site. */
-export type DamageSource = "collision" | "explosion";
+ *  Mostly not consumed beyond being available (per-source feedback like distinct hit
+ *  messages/sounds is future work), except "heat" — see `Engine`'s radiant-heat handling,
+ *  which does use it to distinguish a burn death from a generic one. */
+export type DamageSource = "collision" | "explosion" | "heat";
 
 export class Ship {
   pos: Vec2;
@@ -37,6 +39,9 @@ export class Ship {
   cargo: CargoHold = emptyCargo();
   cargoCapacity = CARGO_CAPACITY;
   signature = 0;
+  // A warning that builds up under radiant heat exposure (see gravity.ts) before any hull
+  // damage happens — see Engine's heat handling for where the threshold/damage ramp lives.
+  temperature = 0;
 
   selectedTool: ToolId = "laser";
   chargesCarried = CHARGE_MAX_CARRIED;
@@ -121,8 +126,20 @@ export class Ship {
   }
 
   takeImpact(damage: number, source: DamageSource) {
-    void source; // not consumed yet — see DamageSource
+    void source; // not consumed here — Engine uses it for per-cause messaging (e.g. heat)
     this.hull = clamp(this.hull - damage, 0, MAX_HULL);
+  }
+
+  /** Net temperature change for one tick — rises with current thermal `exposure` (see
+   *  `radiantHeatExposure`) while any exposure at all is present, cools passively only once
+   *  exposure drops to exactly zero (i.e. fully outside the heat radius). Deliberately not a
+   *  simultaneous rise-minus-decay: at realistic exposure levels the decay rate would dominate
+   *  and temperature could never climb at all (an actual bug this replaced — decay was always
+   *  subtracted, even mid-exposure, and always outweighed the rise). Purely a stat; the
+   *  exposure-to-danger conversion (the warning threshold, the damage ramp) lives in Engine. */
+  updateTemperature(exposure: number, dt: number) {
+    const delta = exposure > 0 ? exposure * TEMPERATURE_RISE_PER_HEAT_UNIT : -TEMPERATURE_DECAY_PER_SEC;
+    this.temperature = clamp(this.temperature + delta * dt, 0, 100);
   }
 
   addCargo(composition: Composition, value: number): number {

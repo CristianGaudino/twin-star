@@ -2,14 +2,17 @@ import type { Engine } from "./engine";
 import { Asteroid, Cell, COMPOSITION_INFO, cellLocalToWorld } from "./asteroid";
 import { Chunk } from "./chunk";
 import { ContactMemory } from "./contacts";
+import { coordinateOf, formatCoordinate } from "./coords";
 import { starsInView } from "./starfield";
 import { TOOLS, ToolId } from "./tools";
 import {
+  BELT_INNER_RADIUS,
   BELT_OUTER_RADIUS,
   BLAST_VISUAL_DURATION,
   CHARGE_BLAST_RADIUS,
   CONTACT_FADE_DURATION,
   CONTACT_FORGET_AFTER,
+  DEATH_SCREEN_DURATION,
   DRILL_ANCHOR_RANGE,
   DRILL_FRACTURE_GENERATIONS,
   HOME_STAR_POS,
@@ -20,6 +23,7 @@ import {
   SCAN_DATA_DISPLAY_RANGE,
   SCAN_RANGE,
   SHIP_RADIUS,
+  TEMPERATURE_DAMAGE_THRESHOLD,
 } from "./constants";
 import { Vec2, add, distance, normalize, scale, sub, v2 } from "./vec2";
 
@@ -48,8 +52,9 @@ export class Renderer {
     ctx.fillRect(0, 0, width, height);
 
     this.renderStars(engine, ctx, toScreen, width, height);
-    this.renderBeltBoundary(engine, ctx, toScreen);
+    this.renderBeltBoundary(ctx, toScreen);
     this.renderHomeStar(ctx, toScreen);
+    this.renderGravitySources(engine, ctx, toScreen);
     this.renderHubMarker(engine, ctx, toScreen);
 
     if (engine.pingActive) {
@@ -62,7 +67,7 @@ export class Renderer {
       ctx.stroke();
     }
 
-    this.renderAsteroids(engine, ctx, toScreen);
+    this.renderAsteroids(engine, ctx, toScreen, offset, width, height);
     for (const chunk of engine.chunks) this.renderChunk(ctx, toScreen, chunk);
     // Cursor highlighting is its own top-level pass — deliberately independent of tool/mode
     // (see hover.ts) and drawn after everything it might highlight, so it's never obscured
@@ -88,6 +93,7 @@ export class Renderer {
 
     this.renderHud(engine, ctx, width, height);
 
+    if (engine.deathScreen) this.renderDeathScreen(engine, ctx, width, height);
     if (engine.paused) this.renderPauseOverlay(ctx, width, height);
   }
 
@@ -113,16 +119,24 @@ export class Renderer {
     }
   }
 
-  /** The home star — a fixed landmark, visual only (no collision yet). Loosely Sirius-A-ish:
-   *  bright, warm, ordinary — the far star (not built yet) is meant to read as its opposite. */
+  /** The home star's visual appearance — a fixed landmark. Loosely Sirius-A-ish: bright, warm,
+   *  ordinary — the far star (not built yet) is meant to read as its opposite. Its gravity well
+   *  and lethal surface (see gravity.ts) are drawn separately in `renderGravitySources`, since
+   *  a future body might want this same hazard indicator with a completely different look.
+   *
+   *  The solid-reading core used to be tiny (r*0.22) with most of the radius spent on a fast,
+   *  faint falloff — so a fully-opaque large asteroid could visually read as *bigger* than the
+   *  star despite HOME_STAR_RADIUS (1100) dwarfing every asteroid's actual radius. Widened the
+   *  near-opaque core and pushed the gradient's bright stops outward so the star reads as a big
+   *  solid body with a modest corona, matching its real declared size. */
   private renderHomeStar(ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
     const p = toScreen(HOME_STAR_POS);
     const r = HOME_STAR_RADIUS;
 
     const gradient = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
     gradient.addColorStop(0, "rgba(255,244,214,1)");
-    gradient.addColorStop(0.15, "rgba(255,224,150,0.9)");
-    gradient.addColorStop(0.4, "rgba(255,190,90,0.35)");
+    gradient.addColorStop(0.3, "rgba(255,230,160,0.95)");
+    gradient.addColorStop(0.6, "rgba(255,195,100,0.55)");
     gradient.addColorStop(1, "rgba(255,170,60,0)");
     ctx.fillStyle = gradient;
     ctx.beginPath();
@@ -131,18 +145,60 @@ export class Renderer {
 
     ctx.fillStyle = "#fff7e0";
     ctx.beginPath();
-    ctx.arc(p.x, p.y, r * 0.22, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, r * 0.5, 0, Math.PI * 2);
     ctx.fill();
   }
 
-  /** The belt's outer edge — "edge of normal operating range," visible but not a wall (nothing
-   *  physically stops travel past it). Dashed and faint since it's a huge unobtrusive backdrop
-   *  element most of the time, not a HUD-grade indicator. */
-  private renderBeltBoundary(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
-    const p = toScreen(engine.hub.pos);
-    ctx.strokeStyle = "rgba(130,165,220,0.12)";
+  /** Generic hazard indicator for every `Engine.gravitySources` entry — a future planet/moon
+   *  gets this same warning ring automatically, with zero renderer changes, just by existing in
+   *  that list. Pull radius is a soft dashed blue line (you can feel it before it's dangerous);
+   *  a radiating source additionally gets a warm amber ring at its own `heatRadius` (a distinct
+   *  dash pattern so the two still read separately even when the radii happen to coincide, as
+   *  they do for the home star today); lethal sources get a tight red ring right at the actual
+   *  kill radius so "this far and no closer without thrust" is an explicit line, not a guess. */
+  private renderGravitySources(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+    for (const source of engine.gravitySources) {
+      const p = toScreen(source.pos);
+
+      ctx.strokeStyle = "rgba(140,180,255,0.18)";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([10, 10]);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, source.pullRadius, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      if (source.heatRadius) {
+        ctx.strokeStyle = "rgba(255,170,90,0.22)";
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 14]);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, source.heatRadius, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      if (source.lethal) {
+        ctx.strokeStyle = "rgba(255,90,90,0.5)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, source.radius * 1.15, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+  }
+
+  /** The belt ring itself — a real landmark around the star (not the hub), both its inner and
+   *  outer edge, visible but not a wall (nothing physically stops travel through it). Dashed and
+   *  faint since it's a large backdrop element most of the time, not a HUD-grade indicator. */
+  private renderBeltBoundary(ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+    const p = toScreen(HOME_STAR_POS);
+    ctx.strokeStyle = "rgba(130,165,220,0.16)";
     ctx.lineWidth = 2;
     ctx.setLineDash([26, 20]);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, BELT_INNER_RADIUS, 0, Math.PI * 2);
+    ctx.stroke();
     ctx.beginPath();
     ctx.arc(p.x, p.y, BELT_OUTER_RADIUS, 0, Math.PI * 2);
     ctx.stroke();
@@ -187,8 +243,31 @@ export class Renderer {
     }
   }
 
-  private renderAsteroids(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+  /** Skips any asteroid whose bounding circle doesn't reach the visible viewport at all — the
+   *  system now spans a belt ring plus a normal-area band, both far larger than one screen, but
+   *  every asteroid's every cell was still being path-constructed and filled/stroked
+   *  unconditionally each frame regardless of whether any of it was ever going to be visible.
+   *  Generous margin (outline noise can push a cell beyond `outerRadius`, and `asteroid.center`
+   *  is a live but approximate centroid — see recomputeDriftGroups). */
+  private renderAsteroids(
+    engine: Engine,
+    ctx: CanvasRenderingContext2D,
+    toScreen: (p: Vec2) => Vec2,
+    offset: Vec2,
+    width: number,
+    height: number,
+  ) {
+    const margin = 300;
     for (const asteroid of engine.asteroids) {
+      const reach = asteroid.outerRadius + margin;
+      if (
+        asteroid.center.x + reach < offset.x ||
+        asteroid.center.x - reach > offset.x + width ||
+        asteroid.center.y + reach < offset.y ||
+        asteroid.center.y - reach > offset.y + height
+      ) {
+        continue;
+      }
       this.renderOneAsteroid(asteroid, ctx, toScreen);
     }
   }
@@ -307,8 +386,7 @@ export class Renderer {
     let label: string;
     if (hover.kind === "cell") {
       this.strokePolygon(ctx, toScreen, hover.cell.polygon, "#ffffff", 2);
-      const owner = engine.asteroids.find((a) => a.cells.includes(hover.cell));
-      label = owner?.scanned ? COMPOSITION_INFO[hover.cell.composition].label : "unidentified";
+      label = hover.cell.asteroid.scanned ? COMPOSITION_INFO[hover.cell.composition].label : "unidentified";
     } else {
       // Chunks are small and already visually distinct (loose debris drifting on its own) —
       // an outline circle around them just added clutter. Tooltip only.
@@ -518,9 +596,19 @@ export class Renderer {
     const t = Math.min(tX, tY);
     const pos = add(center, scale(dir, t));
 
-    // Home reads as a distinct color from everything else on radar — it's not a discovery,
-    // it's always there.
-    const rgb = contact.kind === "hub" ? "127,224,141" : "127,224,255";
+    // A ping only tells you something's out there and roughly where — not what it is. Identity
+    // only comes from actually having flown within vision range of it at some point (see
+    // Engine.identifiedContacts); the hub is the one thing you start out already knowing.
+    // Unidentified contacts read as a neutral, uninformative color on purpose — the color coding
+    // itself (hub green, star amber) would otherwise leak what something is before it's earned.
+    const identified = contact.kind === "hub" || engine.identifiedContacts.has(contact.id);
+    const rgb = !identified
+      ? "170,180,190"
+      : contact.kind === "hub"
+        ? "127,224,141"
+        : contact.kind === "star"
+          ? "255,190,110"
+          : "127,224,255";
 
     ctx.save();
     ctx.translate(pos.x, pos.y);
@@ -534,12 +622,16 @@ export class Renderer {
     ctx.fill();
     ctx.restore();
 
-    // Rounded, not exact — a ping gives a bearing and a rough range, not a precise fix.
+    // Ping is a targeting readout, not a location — plain distance from the ship, rounded (not
+    // exact, a ping tells you roughly where to point). The galactic coordinate system (coords.ts)
+    // is a separate concept for the HUD/a future map, not this. Label is generic
+    // ("Unidentified") until identified.
     const dist = Math.round(distance(ship.pos, contact.pos) / 10) * 10;
+    const label = identified ? contact.label : "Unidentified";
     ctx.fillStyle = `rgba(${rgb},${alpha})`;
     ctx.font = "11px monospace";
     ctx.textAlign = "center";
-    ctx.fillText(`${dist}m`, pos.x, pos.y + (dir.y > 0 ? 18 : -12));
+    ctx.fillText(`${label} ${dist}m`, pos.x, pos.y + (dir.y > 0 ? 18 : -12));
   }
 
   private renderHud(engine: Engine, ctx: CanvasRenderingContext2D, width: number, height: number) {
@@ -576,6 +668,16 @@ export class Renderer {
     y += lineH + 2;
 
     bar("HULL", ship.hull / 100, ship.hull > 30 ? "#7de08d" : "#ff6b6b", ` ${ship.hull.toFixed(0)}/100`);
+    // Only shown once it means something — no clutter when nowhere near a heat source.
+    if (ship.temperature > 1) {
+      const overheating = ship.temperature > TEMPERATURE_DAMAGE_THRESHOLD;
+      bar(
+        "TEMP",
+        ship.temperature / 100,
+        overheating ? "#ff6b6b" : "#ffcf5c",
+        ` ${ship.temperature.toFixed(0)}%${overheating ? " — OVERHEATING" : ""}`,
+      );
+    }
     bar("CARGO", ship.cargoUsed / ship.cargoCapacity, "#7fe0ff", ` ${ship.cargoUsed}/${ship.cargoCapacity}`);
     bar("SIGNATURE", ship.signature / 100, "#ffa25c", ` ${ship.signature.toFixed(0)}%`);
 
@@ -589,6 +691,13 @@ export class Renderer {
 
     const pingText = engine.pingCooldown > 0 ? `cooling ${engine.pingCooldown.toFixed(1)}s` : "READY";
     ctx.fillText(`PING [Q]: ${pingText}`, panelX, y);
+    y += lineH;
+
+    // Galactic standard coordinate, not raw (x, y) — see coords.ts. Star-anchored, not
+    // ship-relative, so it stays meaningful for a future map rather than just "which way to
+    // point right now" (that's what the radar blips below are for).
+    ctx.fillStyle = "#8f97a3";
+    ctx.fillText(`POS: ${formatCoordinate(coordinateOf(ship.pos))}`, panelX, y);
     y += lineH;
 
     if (asteroid && !asteroid.scanned) {
@@ -607,7 +716,7 @@ export class Renderer {
     const target = engine.currentTarget;
     if (ship.mode === "rcs" && target) {
       const info = COMPOSITION_INFO[target.composition];
-      const targetScanned = engine.asteroids.some((a) => a.scanned && a.cells.includes(target));
+      const targetScanned = target.asteroid.scanned;
       ctx.font = "12px monospace";
       if (targetScanned) {
         ctx.fillStyle = "#e8e8e8";
@@ -671,6 +780,30 @@ export class Renderer {
       ctx.fillText(line, 16, y);
       y += 14;
     }
+  }
+
+  /** Auto-dismissing (see DEATH_SCREEN_DURATION) — death costs a run's haul, not the session,
+   *  so this reads as a hit, not a hard stop. Ship has already respawned by the time this
+   *  shows; the overlay is purely aftermath, not a blocking "press any key." */
+  private renderDeathScreen(engine: Engine, ctx: CanvasRenderingContext2D, width: number, height: number) {
+    const death = engine.deathScreen!;
+    const alpha = Math.min(1, death.timer / (DEATH_SCREEN_DURATION * 0.4)); // hold, then fade over the last stretch
+
+    ctx.fillStyle = `rgba(10,4,4,${0.7 * alpha})`;
+    ctx.fillRect(0, 0, width, height);
+
+    ctx.textAlign = "center";
+    ctx.fillStyle = `rgba(255,107,107,${alpha})`;
+    ctx.font = "bold 30px monospace";
+    ctx.fillText(death.cause, width / 2, height / 2 - 20);
+
+    if (death.cargoLost > 0) {
+      ctx.font = "14px monospace";
+      ctx.fillStyle = `rgba(207,214,224,${alpha})`;
+      ctx.fillText(`${death.cargoLost} CARGO LOST`, width / 2, height / 2 + 16);
+    }
+
+    ctx.textAlign = "left";
   }
 
   private renderPauseOverlay(ctx: CanvasRenderingContext2D, width: number, height: number) {

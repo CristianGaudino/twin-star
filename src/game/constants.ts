@@ -15,6 +15,7 @@ export const CRUISE_TURN_RATE = 9; // rad/s, how fast facing eases toward the mo
 
 // --- Hull / collision ---
 export const MAX_HULL = 100;
+export const DEATH_SCREEN_DURATION = 3; // seconds — auto-dismisses, doesn't block play (see Engine.deathScreen)
 export const COLLISION_DAMAGE_SCALE = 0.11; // hull lost = impact speed * scale
 export const COLLISION_MIN_SPEED = 55; // below this, a bump does no damage
 export const POSITION_CORRECTION_RATE = 20; // per second — fraction of overlap closed each tick, smooths the pop-out
@@ -58,8 +59,12 @@ export const CARGO_CAPACITY = 16;
 // currency conversion — materials are stored as-is, spent directly on whatever needs them
 // later (upgrades, crafting), not abstracted into a number first. Sized as a real station —
 // clearly bigger than the ship, bigger than most asteroids too — not a slightly-large rock.
-export const HUB_RADIUS = 160; // px, visual size in the field
-export const HUB_DOCK_RANGE = 260; // px — how close the ship needs to be to dock
+// Was 160 — smaller than a medium asteroid's max (280), which undercut "bigger than most
+// asteroids." Bumped so the hub clearly reads as the biggest artificial structure around,
+// beating small/medium asteroids outright (a rare large asteroid can still out-mass it — that's
+// fine, a big rock dwarfing a small station is a feature, not a bug).
+export const HUB_RADIUS = 220; // px, visual size in the field
+export const HUB_DOCK_RANGE = 340; // px — how close the ship needs to be to dock
 
 // --- World layout (fixed landmarks — see ARCHITECTURE.md) ---
 // Loosely modeled on Sirius: a bright ordinary primary (home star, built here) and a distant,
@@ -67,15 +72,80 @@ export const HUB_DOCK_RANGE = 260; // px — how close the ship needs to be to d
 // compressed hard from anything astronomically real; grounded in real astronomy for flavor
 // and asymmetry (spec explicitly wants the two stars to feel different), not literal AU scale.
 export const HOME_STAR_POS = v2(0, -6000); // fixed, near the hub, well inside the belt's inner edge
-export const HOME_STAR_RADIUS = 1100; // visual only, no collision yet
 
-// The asteroid belt is the "normal operating range" around home — its own boundary is a fixed
-// landmark, but what's actually scattered inside it (see Engine's belt scattering) is
-// procedural content, not permanent map geometry, and can grow/regenerate later without
-// touching this geometry.
-export const BELT_INNER_RADIUS = 11000; // px from the hub — nothing spawns closer than this
-export const BELT_OUTER_RADIUS = 95000; // px from the hub — edge of normal operating range
-export const BELT_ASTEROID_COUNT = 9;
+// 1 in-fiction "AU" is defined as the hub's own distance from the home star — same logic real
+// astronomy uses to define an AU (Earth's distance from the Sun), scaled to this system's
+// compressed distances rather than the literal ~150-million-km real value. See coords.ts, the
+// galactic standard coordinate system used for the HUD and a future map (not ping/radar, which
+// stays plain distance-from-the-ship). Currently equal to distance(HOME_STAR_POS, hub position
+// at (0,0)) — hardcoded rather than computed since both endpoints are themselves fixed constants.
+export const AU_IN_METERS = 6000;
+export const HOME_STAR_RADIUS = 1100; // physical surface — touching this is lethal, see gravity.ts
+
+// Gravity (see gravity.ts's GravitySource) — a localized well around specific big bodies, not
+// an ambient force everywhere. Pull radius is comfortably less than the hub's distance from
+// the star (6000px) so the dock/hub area is never affected. Strength is tuned to be
+// escapable with full thrust (SHIP_THRUST_ACCEL 260) but only with real margin near the
+// surface — drift in unpowered and gravity alone will pull you the rest of the way in.
+export const HOME_STAR_PULL_RADIUS = 4000;
+export const HOME_STAR_PULL_STRENGTH = 200; // px/s^2 felt at dist=0 (never actually reached — see gravityAccel)
+
+// Radiant heat shares the pull radius (if you're being pulled in, you're already cooking) but
+// is a wholly separate hazard from the pull itself — and a two-stage one, not instant hull
+// damage: exposure first raises Ship.temperature (a visible warning, no damage at all below
+// TEMPERATURE_DAMAGE_THRESHOLD), and only once temperature is high does actual hull damage
+// begin, ramping up toward TEMPERATURE_MAX_DAMAGE_PER_SEC at full overheat. Touching the
+// lethal surface itself is still unconditional instant death regardless of temperature.
+export const HOME_STAR_HEAT_INTENSITY = 40; // thermal exposure at dist=0 (never reached) — see radiantHeatDamage
+
+// --- Ship temperature (see Engine's heat handling) ---
+// Tuned so a full-speed, dead-straight flight from the edge of the heat radius into the
+// lethal surface takes real hull damage along the way, not just an instant "touch it, die"
+// with no ramp-up — you can still choose to push in close, but it costs you before it kills
+// you. (First pass was too gentle here: reaching the damage phase took longer than a direct
+// approach actually spends in the heat radius at all, so heat never visibly did anything.)
+export const TEMPERATURE_RISE_PER_HEAT_UNIT = 1.3; // %/sec per unit of thermal exposure
+export const TEMPERATURE_DECAY_PER_SEC = 15; // passive cool-down whenever not currently exposed
+export const TEMPERATURE_DAMAGE_THRESHOLD = 50; // below this, temperature is a pure warning — zero hull damage
+export const TEMPERATURE_MAX_DAMAGE_PER_SEC = 35; // hull damage/sec once temperature hits 100
+
+// The asteroid belt is a real ring around the STAR (not the hub) — a dense, deliberate landmark
+// you travel to reach, the same way a real solar system's belt is a specific band, not "most of
+// the system." Distances below are from HOME_STAR_POS. In AU (AU_IN_METERS): inner 4.8 AU,
+// outer 6.8 AU — a 2 AU-wide ring centered ~5.8 AU out.
+export const BELT_INNER_RADIUS = 28800;
+export const BELT_OUTER_RADIUS = 40800;
+export const BELT_ASTEROID_COUNT = 24; // full multi-cell bodies — see BELT_SIZE_POOL for size mix
+export const BELT_TINY_ROCK_COUNT = 24; // one mineable cell each (see TINY_ROCK_RADIUS)
+// Which ASTEROID_SIZE_CLASSES index each new belt body draws from, repeated per relative weight
+// (a cheap weighting scheme — not worth a general weighted-pick helper for two call sites, see
+// NORMAL_AREA_SIZE_POOL). The belt skews toward its own larger classes (1=medium, 2=large) —
+// it's the "big stuff, worth the trip" landmark, unlike the smaller general scatter below.
+export const BELT_SIZE_POOL = [0, 1, 1, 2, 2];
+
+// Between the hub/star's safe zone and the belt's inner edge: not empty, and not the belt's own
+// density either — a moderate scatter of mostly-smaller asteroids so there's real reason to mine
+// on the way out, without undercutting the belt as the destination. Also star-anchored, for the
+// same reason the belt is (one consistent reference frame — see coords.ts).
+export const NORMAL_AREA_INNER_RADIUS = 7200; // 1.2 AU — clear of the star's own hazard radius
+export const NORMAL_AREA_OUTER_RADIUS = BELT_INNER_RADIUS; // fills the gap up to the belt, no overlap
+export const NORMAL_AREA_ASTEROID_COUNT = 18;
+export const NORMAL_AREA_TINY_ROCK_COUNT = 16;
+// Skewed hard toward small (index 0) — occasional medium, no large; large stays belt-exclusive.
+export const NORMAL_AREA_SIZE_POOL = [0, 0, 0, 0, 1, 1];
+
+// A separate, guaranteed population of small boulders in a short band just outside the hub
+// itself (still hub-relative, unlike everything else above) — regardless of belt/normal-area
+// randomness, there's always something to find within the first few seconds of undocking.
+export const NEAR_HUB_ROCK_COUNT = 10;
+export const NEAR_HUB_ROCK_RADIUS = { min: 1500, max: 7000 }; // px from the hub — well outside dock range
+
+// Most belt bodies start fully at rest — a fraction get a small initial drift instead (see
+// Asteroid.initialVelocity), just enough that the field doesn't read as a frozen diagram. Real
+// motion after that comes from actual forces (collisions, blasts, and now gravity near a
+// massive body), same as everything else in this game's physics.
+export const BELT_DRIFT_CHANCE = 0.35; // fraction of bodies that start moving at all
+export const BELT_DRIFT_SPEED = { min: 5, max: 20 }; // px/s, random direction
 
 // --- Asteroid shape (irregular rock, Voronoi-cell interior) ---
 export const ASTEROID_BASE_RADIUS = 190; // reference size — seed count scales off this, see seedCountForRadius
@@ -87,34 +157,53 @@ export const MIN_CELL_AREA = 90; // px^2 — remainder below this ejects wholesa
 export const CELL_TOUCH_EPSILON = 2;
 
 // A belt should read as varied, not stamped from one template — three rough size classes,
-// picked randomly per asteroid (see Engine's belt scattering).
+// picked randomly per asteroid (see Engine's belt scattering). Large's ceiling was 500 —
+// trimmed to 420 (with its own outline noise, up to ~570 at the extreme) so nothing in the belt
+// can visually rival HOME_STAR_RADIUS (1100), and so the hub (220) unambiguously beats small and
+// medium outright, with only large ever coming close to out-sizing it.
 export const ASTEROID_SIZE_CLASSES: { min: number; max: number }[] = [
   { min: 70, max: 140 }, // small
   { min: 160, max: 280 }, // medium — roughly the old single-asteroid scale
-  { min: 320, max: 500 }, // large
+  { min: 320, max: 420 }, // large
 ];
+
+// Standalone boulders (BELT_TINY_ROCK_COUNT) — small enough that subdividing into multiple
+// Voronoi cells would be silly, so these force a single cell (the whole rock, one mineable
+// piece) rather than going through the normal size-based seed count.
+export const TINY_ROCK_RADIUS = { min: 20, max: 48 };
 
 // --- Sensors ---
 // Rescaled alongside the belt (see above) — these were tuned for a world a few hundred px
 // across. VISION_RADIUS/SCAN_RANGE needed to grow just to stay usable at real asteroid sizes.
 // PING_MAX_RADIUS deliberately does NOT try to cover meaningful fractions of the belt — it's a
-// short-range "reveal just past the horizon" tool (a bit past typical screen half-diagonal),
-// not a way to skip exploring. Longer range is a future upgrade, not the baseline.
+// short-range "reveal just past the horizon" tool, not a way to skip exploring. Nudged up
+// slightly so it comfortably reaches the guaranteed near-hub rocks (NEAR_HUB_ROCK_RADIUS).
+// Longer range beyond this is a future upgrade, not the baseline.
 export const VISION_RADIUS = 900; // always-visible short range, no ping needed
 export const SCAN_RANGE = 350;
 export const PING_COOLDOWN = 4.5; // seconds
-export const PING_SPEED = 1400; // px/s expansion speed
-export const PING_MAX_RADIUS = 3500;
+export const PING_SPEED = 2200; // px/s expansion speed
+export const PING_MAX_RADIUS = 5500;
 
 // A ping/proximity contact is a last-known snapshot, not a live track — it goes stale and is
 // eventually forgotten if nothing refreshes it, so radar reflects what you actually know, not
-// the ground truth.
-export const CONTACT_FORGET_AFTER = 45; // seconds since last refresh before a contact is dropped
-export const CONTACT_FADE_DURATION = 8; // seconds — the blip fades out over this final stretch
+// the ground truth. Deliberately short: a ping tells you what's nearby right now, not a
+// permanent mark — re-ping to refresh instead of it just sitting on screen indefinitely.
+export const CONTACT_FORGET_AFTER = 16; // seconds since last refresh before a contact is dropped
+export const CONTACT_FADE_DURATION = 6; // seconds — the blip fades out over this final stretch
+// A contact is also dropped once the ship is simply too far from its last-known position,
+// regardless of how recently it was refreshed — a ping reveals what's in range, not a permanent
+// GPS lock you can wander arbitrarily far from and still see. Set comfortably past
+// PING_MAX_RADIUS so a contact caught at the very edge of a ping doesn't instantly vanish.
+export const CONTACT_MAX_RANGE = 7000;
 
 // Scan is a held action, not a tap: hold E in range and a wave sweeps outward
-// from the asteroid's center; leaving range or letting go decays progress.
-export const SCAN_HOLD_SECONDS = 1.6;
+// from the asteroid's center; leaving range or letting go decays progress. Duration scales with
+// the target's own size (see asteroid.ts's scanSecondsForRadius) — a bigger asteroid takes
+// longer to read, sublinearly, so it's noticeable but never absurd.
+export const SCAN_HOLD_SECONDS = 1.6; // reference duration at ASTEROID_BASE_RADIUS
+export const SCAN_SECONDS_MIN = 0.6; // floor — even a tiny rock takes a moment
+export const SCAN_SECONDS_MAX = 3.2; // ceiling — even the biggest asteroid caps out here
 export const SCAN_PROGRESS_DECAY = 1.0; // per second, when not actively scanning
 // Must comfortably exceed the largest asteroid's radius (see ASTEROID_SIZE_CLASSES) — this is
 // measured from the asteroid's *center*, so sitting right on the surface of a large asteroid

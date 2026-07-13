@@ -1,6 +1,13 @@
 import { Vec2, add, distance, dot, fromAngle, normalize, scale, sub, v2 } from "./vec2";
-import { Polygon, clipHalfPlane, pointInPolygon, polygonArea, polygonCentroid } from "./poly";
-import { ASTEROID_BASE_RADIUS, ASTEROID_OUTLINE_POINTS, ASTEROID_SEED_COUNT } from "./constants";
+import { Polygon, boundingRadius, clipHalfPlane, pointInPolygon, polygonArea, polygonCentroid } from "./poly";
+import {
+  ASTEROID_BASE_RADIUS,
+  ASTEROID_OUTLINE_POINTS,
+  ASTEROID_SEED_COUNT,
+  SCAN_HOLD_SECONDS,
+  SCAN_SECONDS_MAX,
+  SCAN_SECONDS_MIN,
+} from "./constants";
 import { ToolId } from "./tools";
 
 export type Composition = "ore" | "crystal" | "unstable";
@@ -65,6 +72,11 @@ export interface Cell {
   boreProgress: number; // drill: 0..1
   fractures: CrackSegment[] | null; // drill fracture visual — see cellLocalToWorld
   shade: string; // pre-scan rock color, varied per cell so the body reads as textured, not flat
+  // Permanent back-reference, set once at creation — unlike drift-group membership (which
+  // changes when mining splits a body), a cell's origin asteroid never changes. Lets callers
+  // that need "which asteroid is this from" (e.g. renderer hover/target lookups) do an O(1)
+  // read instead of a linear search over every asteroid's every cell.
+  asteroid: Asteroid;
 }
 
 /** A point expressed relative to a cell's own centroid, in a basis built from
@@ -138,6 +150,28 @@ function makeCompositionPicker(weights: Record<Composition, number> = DEFAULT_CO
 function seedCountForRadius(radius: number): number {
   const scaled = ASTEROID_SEED_COUNT * Math.sqrt(radius / ASTEROID_BASE_RADIUS);
   return Math.round(Math.max(6, Math.min(60, scaled)));
+}
+
+/** Bigger asteroids take longer to scan, same sqrt-scaled shape as `seedCountForRadius` — a
+ *  large body should feel like more to read, but sublinearly, not 3x the wait for 3x the
+ *  radius. Calibrated so the original base radius (190) reproduces the original flat scan time
+ *  (SCAN_HOLD_SECONDS), clamped so a tiny rock is never instant and the biggest asteroid never
+ *  drags on forever. */
+export function scanSecondsForRadius(radius: number): number {
+  const scaled = SCAN_HOLD_SECONDS * Math.sqrt(radius / ASTEROID_BASE_RADIUS);
+  return Math.max(SCAN_SECONDS_MIN, Math.min(SCAN_SECONDS_MAX, scaled));
+}
+
+/** Coarse human-readable size bucket for a radius — used for radar contact labels (see Engine's
+ *  getContacts) so an identified rock reads as e.g. "Large Asteroid" instead of just "Asteroid".
+ *  Thresholds sit at the midpoints between ASTEROID_SIZE_CLASSES/TINY_ROCK_RADIUS's own gaps,
+ *  not exact range membership — a drift group's *current* bounding radius shrinks as it's mined
+ *  down, so it won't always land cleanly inside one of those original spawn ranges. */
+export function sizeLabelForRadius(radius: number): string {
+  if (radius < 55) return "Tiny";
+  if (radius < 150) return "Small";
+  if (radius < 300) return "Medium";
+  return "Large";
 }
 
 function generateOutline(center: Vec2, baseRadius: number, rand: () => number): Polygon {
@@ -238,6 +272,15 @@ let nextCellId = 1;
 export interface AsteroidOptions {
   radius?: number; // defaults to ASTEROID_BASE_RADIUS — the belt scatters a range of sizes
   compositionWeights?: Record<Composition, number>; // lets one body skew ore-rich, another crystal-rich, etc.
+  // Overrides seedCountForRadius — a small standalone boulder (see Engine's belt scattering)
+  // wants exactly 1 cell (the whole body, one mineable piece) rather than the handful the
+  // normal size-based formula would still produce at a small-but-not-tiny radius.
+  seedCount?: number;
+  // Picked up once by Engine.recomputeDriftGroups on the very first frame only, to seed that
+  // body's initial drift — most of the belt starts fully at rest, but a few bodies drifting
+  // from the start reads as a livelier field. Irrelevant after the first frame (the group's own
+  // `vel` takes over from there).
+  initialVelocity?: Vec2;
 }
 
 export class Asteroid {
@@ -248,6 +291,7 @@ export class Asteroid {
   neighbors: Map<number, number[]>;
   scanned = false;
   scanProgress = 0; // 0..1 — climbs while the ship holds a scan in range, decays otherwise
+  initialVelocity: Vec2;
 
   constructor(center: Vec2, rand: () => number = Math.random, options: AsteroidOptions = {}) {
     const radius = options.radius ?? ASTEROID_BASE_RADIUS;
@@ -255,8 +299,9 @@ export class Asteroid {
 
     this.center = center;
     this.outerRadius = radius;
+    this.initialVelocity = options.initialVelocity ?? v2(0, 0);
     this.outline = generateOutline(center, radius, rand);
-    const seeds = scatterSeeds(center, this.outline, seedCountForRadius(radius), rand);
+    const seeds = scatterSeeds(center, this.outline, options.seedCount ?? seedCountForRadius(radius), rand);
 
     this.cells = [];
     for (let i = 0; i < seeds.length; i++) {
@@ -276,15 +321,23 @@ export class Asteroid {
         boreProgress: 0,
         fractures: null,
         shade: `rgb(${tone},${tone},${tone + 4})`,
+        asteroid: this,
       });
     }
     this.neighbors = computeNeighbors(this.cells);
   }
 
-  /** Classify a world point into the intact cell containing it, or null. */
+  /** Classify a world point into the intact cell containing it, or null. Cheap bounding-radius
+   *  reject before the real point-in-polygon test — this is called every single frame
+   *  (Engine.computeHoverTarget runs unconditionally, any mode/tool) across every asteroid in
+   *  the belt, so a cell nowhere near worldPos should never pay for a full ray-cast. Keyed off
+   *  the cell's own current centroid/shape rather than the asteroid's fixed origin, so it stays
+   *  correct for cells that have drifted far from where this asteroid originally spawned. */
   cellAt(worldPos: Vec2): Cell | null {
     for (const cell of this.cells) {
       if (cell.fractured) continue;
+      const reach = boundingRadius(cell.polygon, cell.centroid);
+      if (distance(worldPos, cell.centroid) > reach) continue;
       if (pointInPolygon(worldPos, cell.polygon)) return cell;
     }
     return null;
