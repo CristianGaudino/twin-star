@@ -5,13 +5,22 @@ import { v2 } from "./vec2";
 
 // --- Ship ---
 export const SHIP_RADIUS = 9;
-export const SHIP_THRUST_ACCEL = 260; // px/s^2 — same accel in both modes, RCS stays snappy for precision work
-// Terminal speed = SHIP_THRUST_ACCEL / drag. Cruise ~473 px/s, RCS ~208 px/s —
-// RCS is deliberately capped well below Cruise so it's clearly the wrong
-// choice for covering distance; Cruise is the fast-transit mode.
+export const SHIP_THRUST_ACCEL = 260; // px/s^2 (== m/s^2, 1 world unit is 1 meter) at base (empty-cargo) mass
+// Real F=ma, not a flat accel — SHIP_THRUST_FORCE / Ship.mass is the actual acceleration applied
+// (ship.ts's updateMovement). 7800 = SHIP_THRUST_ACCEL (260) * SHIP_MASS (30, see below) — a
+// literal, not a live reference, since SHIP_MASS is declared further down this file; picked
+// specifically so an empty ship's handling is bit-for-bit identical to before this existed, and
+// only a loaded hold changes anything. Same force in both modes — RCS's own distinct feel comes
+// entirely from its higher drag, not a different force output.
+export const SHIP_THRUST_FORCE = 7800;
+// Terminal speed = SHIP_THRUST_ACCEL / drag. RCS is deliberately capped well below Cruise so
+// it's clearly the wrong choice for covering distance; Cruise is the fast-transit mode.
 export const CRUISE_DRAG = 0.55; // fraction of velocity shed per second
 export const RCS_DRAG = 1.25; // tighter, for precision positioning — not for travel
 export const CRUISE_TURN_RATE = 9; // rad/s, how fast facing eases toward the mouse
+// m/s — the practical "100%" reference for the HUD speedometer, not a hard cap (gravity,
+// collisions, and blast knockback can all push instantaneous speed past this).
+export const CRUISE_TERMINAL_SPEED = SHIP_THRUST_ACCEL / CRUISE_DRAG; // ~473 m/s
 
 // --- Hull / collision ---
 export const MAX_HULL = 100;
@@ -31,13 +40,24 @@ export const MAX_COLLISION_SUBSTEPS = 4; // hard cap, so a runaway velocity can'
 // One mass system, shared by every collision in the game (see physics.ts's RigidRef/
 // resolveContact, used for all of ship-rock, rock-rock, chunk-rock, chunk-chunk, and
 // chunk-ship). SHIP_MASS is the ship's one fixed mass, used everywhere the ship collides —
-// never recomputed ad hoc per collision type. ROCK_MASS_PER_AREA converts polygon area to
-// mass and is shared by rock cells *and* chunks (a chunk is the same material, just no
-// longer attached to a larger body), so a single loose cell feels roughly ship-weight, a
-// small broken-off chunk is properly much lighter than either, and the full asteroid is
-// heavy enough to barely register a nudge from one hit.
+// never recomputed ad hoc per collision type. ROCK_MASS_PER_AREA converts polygon area to mass
+// at ordinary rock's own density — every other resource scales this by its own real density
+// relative to rock's (see asteroid.ts's massForArea/massPerAreaFor, the one function every rock
+// cell, drift group, *and* loose chunk goes through, so a Nickel-Iron cell is exactly as heavy
+// as the Nickel-Iron chunk it becomes once extracted, not two disconnected numbers). A single
+// loose cell of ordinary rock feels roughly ship-weight, a small broken-off chunk of it is
+// properly much lighter than either, and a full asteroid is heavy enough to barely register a
+// nudge from one hit — denser resources (Nickel-Iron, Platinum-Group Ore) shift all of that
+// heavier, lighter ones (Water Ice) shift it lighter.
 export const SHIP_MASS = 30;
-export const ROCK_MASS_PER_AREA = 0.01; // px^2 -> mass
+export const ROCK_MASS_PER_AREA = 0.01; // px^2 -> mass, at ordinary rock's density
+// How much collision mass a full cargo hold adds to the ship (see Ship.mass) — a loaded ship is
+// genuinely heavier, same as a real vessel. 0.04 * CARGO_CAPACITY_KG (750) = +30, i.e. a full
+// hold roughly doubles the ship's base mass (30). Feeds both collision momentum *and* thrust
+// (SHIP_THRUST_FORCE / mass, see ship.ts's updateMovement) — a full hold is a real, noticeable
+// difference in both, not dwarfing either. Reduced by Cargo Stabilizers (upgrades.ts), not
+// eliminated.
+export const CARGO_MASS_FACTOR = 0.04;
 
 // Materials (see physics.ts Material/combineMaterials) — each kind defines its own bounce and
 // grip exactly once; every pairing's behavior (ship-rock, chunk-rock, chunk-chunk, chunk-ship,
@@ -52,7 +72,16 @@ export const CHUNK_RESTITUTION = 0.5;
 export const CHUNK_FRICTION = 0.96; // light grip — was previously frictionless everywhere but the ship
 
 // --- Cargo ---
-export const CARGO_CAPACITY = 16;
+// A real weight limit (kg), not an abstract slot count — see asteroid.ts's weightKgFor. Two
+// resources with the same chunkValue (rough physical size) still weigh differently by their real
+// density, so a hold full of Nickel-Iron fills up faster than the same hold full of Water Ice.
+// 750kg is sized for a small, single-operator mining vessel, not a bulk freighter — picked so a
+// "typical" chunk of ordinary rock (chunkValue 1 at REFERENCE_CELL_AREA, density 3.3) works out
+// to roughly the same number of pickups-to-full the old abstract 16-unit cap gave.
+export const CARGO_CAPACITY_KG = 750;
+// kg contributed per (chunkValue unit * g/cm^3 of density) — the conversion factor between the
+// game's abstracted "how big a piece is" number and an actual kilogram figure.
+export const MATERIAL_WEIGHT_SCALE = 12;
 
 // --- Hub ---
 // The home base: a fixed point you dock at to deposit whatever's in the hold. Deliberately no
@@ -63,8 +92,28 @@ export const CARGO_CAPACITY = 16;
 // asteroids." Bumped so the hub clearly reads as the biggest artificial structure around,
 // beating small/medium asteroids outright (a rare large asteroid can still out-mass it — that's
 // fine, a big rock dwarfing a small station is a feature, not a bug).
-export const HUB_RADIUS = 220; // px, visual size in the field
+export const HUB_RADIUS = 220; // px, base visual/collision-contact size — see Hub.radius for the grown value
 export const HUB_DOCK_RANGE = 340; // px — how close the ship needs to be to dock
+
+// hub-growth-spec.md — the hub's footprint genuinely grows with what's been built, not just its
+// appearance: Hub.radius (hub.ts) adds this per owned Hub Facility on top of HUB_RADIUS, and
+// Engine.hubContact() uses that grown value too, so a more built-up hub is also a bigger, easier
+// target to spot on ping/vision — a real, deliberate mechanical side effect of visual growth, not
+// just a cosmetic one. Capped by construction (5 facilities today, 220 + 5*8 = 260) to stay
+// comfortably under the Large asteroid size class (320-420) — a rare large asteroid should still
+// be able to out-mass the hub, that's a feature (see ASTEROID_SIZE_CLASSES' own doc comment).
+export const HUB_RADIUS_GROWTH_PER_FACILITY = 8;
+// Distance beyond the (grown) ring radius a Facility Module's own center sits, and the short
+// strut connecting it back to the ring — see Renderer.renderHubModule.
+export const HUB_MODULE_OFFSET = 46;
+
+// Dock range is no longer its own purchasable upgrade (Dock Range Extension was cut — a flat,
+// isolated stat purchase disconnected from everything else didn't earn its own slot once the hub
+// had a real growth system to hang it on instead). It now passively scales with the same
+// facilitiesBuilt count that drives Hub.radius — a bigger, more built-up station is easier to
+// approach and dock at for the same reason it's easier to spot on radar, one consistent "size
+// matters" idea instead of a separate purchase for it. See Hub.dockRange.
+export const HUB_DOCK_RANGE_GROWTH_PER_FACILITY = 40;
 
 // --- World layout (fixed landmarks — see ARCHITECTURE.md) ---
 // Loosely modeled on Sirius: a bright ordinary primary (home star, built here) and a distant,
@@ -97,6 +146,15 @@ export const HOME_STAR_PULL_STRENGTH = 200; // px/s^2 felt at dist=0 (never actu
 // begin, ramping up toward TEMPERATURE_MAX_DAMAGE_PER_SEC at full overheat. Touching the
 // lethal surface itself is still unconditional instant death regardless of temperature.
 export const HOME_STAR_HEAT_INTENSITY = 40; // thermal exposure at dist=0 (never reached) — see radiantHeatDamage
+
+// Solar power (see gravity.ts's solarExposure, fuel-power-spec.md) — deliberately NOT the same
+// radius as the pull/heat wells above. Those are short-range hazards; realistic sunlight is
+// useful at real interplanetary distances well past any hazard the star itself poses, so this
+// reaches out past the belt's own outer edge (40800) — most of the system gets *some* charge,
+// with a real gradient the closer you get, while the dangerous zone stays exactly as tight as it
+// already was.
+export const HOME_STAR_SOLAR_RADIUS = 60000;
+export const HOME_STAR_SOLAR_INTENSITY = 40; // exposure at dist=0 (never reached — inside the lethal surface)
 
 // --- Ship temperature (see Engine's heat handling) ---
 // Tuned so a full-speed, dead-straight flight from the edge of the heat radius into the
@@ -152,6 +210,15 @@ export const ASTEROID_BASE_RADIUS = 190; // reference size — seed count scales
 export const ASTEROID_OUTLINE_POINTS = 26;
 export const ASTEROID_SEED_COUNT = 32; // seed count at ASTEROID_BASE_RADIUS
 export const MIN_CELL_AREA = 90; // px^2 — remainder below this ejects wholesale rather than slicing further
+// A chunk's actual cargo value scales with the physical area extracted (see
+// asteroid.ts's chunkValueForArea) rather than a flat per-composition constant — a piece cut
+// from a huge cell should yield more than the same composition cut from a tiny one. This is the
+// area at which a resource's COMPOSITION_INFO.chunkValue applies exactly as written; smaller
+// pieces yield less, bigger pieces yield more, both sublinearly (sqrt, same shape as
+// seedCountForRadius/scanSecondsForRadius) so an extreme outlier doesn't overflow cargo in one
+// grab. Derived from the original single-asteroid default: pi * ASTEROID_BASE_RADIUS^2 /
+// ASTEROID_SEED_COUNT, i.e. the average cell area a "medium" body has always had.
+export const REFERENCE_CELL_AREA = 3500;
 // Two cells count as still touching if their boundaries are within this distance — checked
 // against current (possibly laser-shrunk) geometry, not just "were they neighbors originally."
 export const CELL_TOUCH_EPSILON = 2;
@@ -191,11 +258,25 @@ export const PING_MAX_RADIUS = 5500;
 // permanent mark — re-ping to refresh instead of it just sitting on screen indefinitely.
 export const CONTACT_FORGET_AFTER = 16; // seconds since last refresh before a contact is dropped
 export const CONTACT_FADE_DURATION = 6; // seconds — the blip fades out over this final stretch
-// A contact is also dropped once the ship is simply too far from its last-known position,
-// regardless of how recently it was refreshed — a ping reveals what's in range, not a permanent
-// GPS lock you can wander arbitrarily far from and still see. Set comfortably past
-// PING_MAX_RADIUS so a contact caught at the very edge of a ping doesn't instantly vanish.
+// A contact past this range from the ship's *current* position no longer shows up on the
+// in-field tactical radar (Renderer.renderRadarIndicator) — a ping reveals what's in range, not
+// a permanent GPS lock you can wander arbitrarily far from and still see. This is a display-only
+// cutoff, not a memory one (see MAP_CONTACT_FORGET_AFTER below) — the hub map is exactly the
+// place that longer-range memory is meant to be useful. Set comfortably past PING_MAX_RADIUS so
+// a contact caught at the very edge of a ping doesn't instantly vanish from tactical radar.
 export const CONTACT_MAX_RANGE = 7000;
+
+// The hub Map screen (map-radar-spec.md) reads the same discoveredContacts memory as tactical
+// radar, just with a much longer staleness window and no ship-distance cutoff at all — "a chart,
+// not a live feed." A contact between CONTACT_FORGET_AFTER and this age still shows on the map,
+// dimmed (stale — last-known, not current); past this it's forgotten there too, same as radar.
+export const MAP_CONTACT_FORGET_AFTER = 240; // seconds
+
+// Fog of war (map-radar-spec.md Section 3) — coarse grid, not per-pixel. A sector is "explored"
+// permanently once any sensor source's radius has swept it — see Engine.markExplored. Cheap by
+// design: every sensor's radius today is small relative to this, so at most a handful of sectors
+// are touched per source per frame.
+export const MAP_SECTOR_SIZE = 4000; // px per fog-of-war grid cell
 
 // Scan is a held action, not a tap: hold E in range and a wave sweeps outward
 // from the asteroid's center; leaving range or letting go decays progress. Duration scales with
@@ -254,6 +335,44 @@ export const CHARGE_CHUNK_PUSH_MAX = 260; // px/s knockback for loose chunks at 
 export const BLAST_VISUAL_DURATION = 0.5; // seconds, shockwave ring + flash lifetime
 
 export const SIGNATURE_DECAY_PER_SEC = 10;
+
+// --- Fuel & Power (fuel-power-spec.md) ---
+// Fuel: pure consumable, thrust-only, never regenerates passively — see Ship.updateMovement.
+// Burn is keyed off thrustForce itself (not the resulting acceleration), so a loaded ship burns
+// at the same rate as an empty one for the same throttle input — the mass penalty already lives
+// entirely on the acceleration side (SHIP_THRUST_FORCE / mass), fuel burn doesn't double-tax it.
+export const FUEL_CAPACITY = 100;
+export const FUEL_BURN_PER_FORCE_SECOND = 0.00015; // fuel/sec = thrustForce * this, while thrusting
+
+// Battery: everything except thrust. Passive baseline regen everywhere (never fully dark
+// forever), boosted by solar exposure near a star — see Engine's power handling.
+export const BATTERY_CAPACITY = 100;
+export const BATTERY_BASELINE_REGEN_PER_SEC = 1.5;
+export const BATTERY_SOLAR_REGEN_MULT = 0.15; // battery/sec per unit of solar exposure (see gravity.ts)
+export const REACTOR_DOCK_SOLAR_BOOST = 8; // extra battery/sec while near the hub, once Reactor is built
+
+// Passive vision drops to this once battery is empty — blind but not helpless, matches the
+// two-different-failure-modes design (out of fuel = stranded, out of power = blind but mobile).
+export const POWERLESS_VISION_RADIUS = 150;
+export const VISION_POWER_DRAW_PER_SEC = 0.5;
+export const PING_POWER_COST = 8; // one-time, on trigger
+export const SCAN_POWER_DRAW_PER_SEC = 2;
+export const LASER_POWER_PER_SEC = 3;
+export const DRILL_POWER_PER_SEC = 4;
+export const CHARGE_POWER_PER_USE = 10;
+
+// --- Passive Ping (map-radar-spec.md Section 5) — Ship.passivePingInterval (upgradable, 0 =
+// disabled) gates whether this fires at all; radius is deliberately well under a manual ping's,
+// so manual ping (Q) stays the stronger, deliberate tool rather than becoming obsolete.
+export const PASSIVE_PING_INTERVAL = 45; // seconds between automatic sweeps, once unlocked
+export const PASSIVE_PING_RADIUS = 2500; // instant reveal radius — no expanding-wave visual, unlike manual ping
+export const PASSIVE_PING_POWER_COST = 4; // per pulse — half of manual ping's cost, gated by ship.powered same as it
+
+// --- Satellites (map-radar-spec.md Section 6) — fixed-position, player-deployed sensor sources.
+// Capped via Hub.satelliteCap (Observatory/Satellite Bay) so "carpet the belt in them" isn't the
+// answer — deploying one is a real, costed decision, not a trivial spam.
+export const SATELLITE_VISION_RADIUS = 1600;
+export const SATELLITE_DEPLOY_COST = { nickelIron: 20, crystal: 10 } as const;
 
 // --- Chunks ---
 export const CHUNK_DRAG = 0.15;

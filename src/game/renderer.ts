@@ -1,10 +1,22 @@
 import type { Engine } from "./engine";
-import { Asteroid, Cell, COMPOSITION_INFO, cellLocalToWorld } from "./asteroid";
+import {
+  ASTEROID_TYPE_INFO,
+  Asteroid,
+  COMPOSITIONS,
+  COMPOSITION_INFO,
+  Cell,
+  RESOURCE_WEIGHTS_BY_TYPE,
+  cellLocalToWorld,
+  weightKgFor,
+} from "./asteroid";
 import { Chunk } from "./chunk";
 import { ContactMemory } from "./contacts";
 import { coordinateOf, formatCoordinate } from "./coords";
+import { dustInView } from "./dustfield";
+import { Hub } from "./hub";
 import { starsInView } from "./starfield";
 import { TOOLS, ToolId } from "./tools";
+import { UpgradeId } from "./upgrades";
 import {
   BELT_INNER_RADIUS,
   BELT_OUTER_RADIUS,
@@ -12,20 +24,52 @@ import {
   CHARGE_BLAST_RADIUS,
   CONTACT_FADE_DURATION,
   CONTACT_FORGET_AFTER,
+  CONTACT_MAX_RANGE,
+  CRUISE_TERMINAL_SPEED,
   DEATH_SCREEN_DURATION,
   DRILL_ANCHOR_RANGE,
   DRILL_FRACTURE_GENERATIONS,
   HOME_STAR_POS,
   HOME_STAR_RADIUS,
-  HUB_DOCK_RANGE,
+  HOME_STAR_SOLAR_RADIUS,
+  HUB_MODULE_OFFSET,
   HUB_RADIUS,
   PING_MAX_RADIUS,
+  SATELLITE_VISION_RADIUS,
   SCAN_DATA_DISPLAY_RANGE,
   SCAN_RANGE,
   SHIP_RADIUS,
   TEMPERATURE_DAMAGE_THRESHOLD,
 } from "./constants";
-import { Vec2, add, distance, normalize, scale, sub, v2 } from "./vec2";
+import { Vec2, add, distance, fromAngle, length, lerp, normalize, scale, sub, v2 } from "./vec2";
+
+type HubModuleKind = "researchLab" | "observatory" | "satelliteBay" | "reactor" | "refinery";
+
+interface HubModuleSlot {
+  id: UpgradeId; // must be a Hub Facility upgrade (category "hubFacility")
+  angleDeg: number;
+  kind: HubModuleKind;
+  rgb: string; // "r,g,b" — not hex, so alpha can be layered on directly per-draw
+}
+
+/** hub-growth-spec.md Section 2 — a fixed, permanent angle per Hub Facility, so a returning
+ *  player's mental map of "where's the Refinery" never shifts between sessions. Satellite Bay's
+ *  color deliberately matches Renderer.renderSatellites' own violet — the module and the thing
+ *  it produces should read as the same color family. Not built yet: Scrapyard/Mining
+ *  Facility/Shipyard/Foundry (upgrades-spec.md Section 3b) — when one of those exists, it's one
+ *  more entry here, at whatever angle keeps the ring evenly spaced, not a restructure. */
+const HUB_FACILITY_SLOTS: HubModuleSlot[] = [
+  { id: "researchLabExpansion", angleDeg: 0, kind: "researchLab", rgb: "159,208,255" },
+  { id: "observatory", angleDeg: 72, kind: "observatory", rgb: "191,224,255" },
+  { id: "satelliteBay", angleDeg: 144, kind: "satelliteBay", rgb: "200,160,255" },
+  { id: "reactor", angleDeg: 216, kind: "reactor", rgb: "255,220,160" },
+  { id: "refinery", angleDeg: 288, kind: "refinery", rgb: "224,162,98" },
+];
+
+// Standard-upgrade ring tells (hub-growth-spec.md Section 4) — point markers placed at the
+// midpoints between facility slots so they never visually collide with a Facility Module.
+const HUB_BEACON_ANGLE_DEG = 36;
+const HUB_REPAIR_BAY_ANGLE_DEG = 108;
 
 /**
  * Draws one frame from Engine's current state. Deliberately stateless and separate from Engine
@@ -52,10 +96,12 @@ export class Renderer {
     ctx.fillRect(0, 0, width, height);
 
     this.renderStars(engine, ctx, toScreen, width, height);
+    this.renderDust(engine, ctx, toScreen, width, height);
     this.renderBeltBoundary(ctx, toScreen);
     this.renderHomeStar(ctx, toScreen);
     this.renderGravitySources(engine, ctx, toScreen);
     this.renderHubMarker(engine, ctx, toScreen);
+    this.renderSatellites(engine, ctx, toScreen);
 
     if (engine.pingActive) {
       const p = toScreen(ship.pos);
@@ -115,6 +161,32 @@ export class Renderer {
       ctx.fillStyle = `rgba(255,255,255,${star.brightness})`;
       ctx.beginPath();
       ctx.arc(p.x, p.y, star.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  /** Belt dust (dustfield.ts) — purely decorative, non-interactable, so the belt reads as a
+   *  genuinely denser/hazier region even at a glance from outside it, not just a landmark once
+   *  you're already among the asteroids. Warm, sandy-rock tone (distinct from the cool white
+   *  starfield behind it) — same color family as the belt's own dominant resource, Chondrite
+   *  Rock. Drawn right after the starfield, before anything else, so it reads as atmosphere
+   *  rather than obscuring any actual gameplay element. */
+  private renderDust(
+    engine: Engine,
+    ctx: CanvasRenderingContext2D,
+    toScreen: (p: Vec2) => Vec2,
+    width: number,
+    height: number,
+  ) {
+    const margin = 100;
+    const originX = engine.ship.pos.x - width / 2;
+    const originY = engine.ship.pos.y - height / 2;
+    const motes = dustInView(originX - margin, originY - margin, originX + width + margin, originY + height + margin);
+    for (const mote of motes) {
+      const p = toScreen(mote.pos);
+      ctx.fillStyle = `rgba(200,185,160,${mote.alpha})`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, mote.r, 0, Math.PI * 2);
       ctx.fill();
     }
   }
@@ -208,38 +280,306 @@ export class Renderer {
   /** The home hub as it appears out in the field — a plain placeholder ring for now (spec's
    *  visual direction isn't decided yet, and there's nothing to visually grow into until
    *  upgrades exist). Shows a dock prompt only once actually in range. */
-  private renderHubMarker(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
-    const p = toScreen(engine.hub.pos);
+  /** Deployed satellites (map-radar-spec.md Section 6) — fixed points, no physics, so this is
+   *  the whole visual: a small ring plus its own vision-radius ghost so it's obvious how much of
+   *  the field it's actually covering right now. */
+  private renderSatellites(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+    for (const sat of engine.satellites) {
+      const p = toScreen(sat.pos);
+      ctx.strokeStyle = "rgba(200,160,255,0.4)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, SATELLITE_VISION_RADIUS, 0, Math.PI * 2);
+      ctx.stroke();
 
-    ctx.strokeStyle = "rgba(127,224,141,0.7)";
-    ctx.lineWidth = 2;
+      ctx.fillStyle = "rgba(200,160,255,0.9)";
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(200,160,255,0.7)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 11, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  /** The hub as a modular outpost, not a lit-up ring (hub-growth-spec.md) — a Core Ring (this
+   *  method) plus a Facility Module per owned Hub Facility (renderHubModule) and fixed solar
+   *  arrays (renderHubSolarArrays), all keyed directly off `Hub`'s existing state — no new
+   *  persisted data needed anywhere for this. `hub.radius` (not the flat HUB_RADIUS constant)
+   *  is the hub's actual current footprint, grown by facilitiesBuilt — see hub.ts. */
+  private renderHubMarker(engine: Engine, ctx: CanvasRenderingContext2D, toScreen: (p: Vec2) => Vec2) {
+    const { hub } = engine;
+    const p = toScreen(hub.pos);
+    const radius = hub.radius;
+    const time = performance.now() / 1000;
+
+    this.renderHubSolarArrays(ctx, p);
+
+    for (const slot of HUB_FACILITY_SLOTS) {
+      if (hub.purchasedUpgrades.has(slot.id)) {
+        this.renderHubModule(ctx, p, radius, slot, hub, engine.satellites.length, time);
+      } else {
+        this.renderHubModuleStub(ctx, p, radius, slot.angleDeg);
+      }
+    }
+
+    // Core ring itself — color shifts toward a brighter cyan-white the more research is
+    // completed (a "how developed is this outpost" tell with no facility footprint of its own),
+    // and Structural Reinforcement thickens the stroke and adds girder ticks around it, a real
+    // cosmetic payoff for a stat that otherwise "pays off once something can damage the hub."
+    const researchTint = Math.min(1, hub.completedResearch.size / 7);
+    const rgb = `${Math.round(lerp(127, 170, researchTint))},${Math.round(lerp(224, 230, researchTint))},${Math.round(lerp(141, 255, researchTint))}`;
+    const reinforced = hub.purchasedUpgrades.has("structuralReinforcement");
+
+    ctx.strokeStyle = `rgba(${rgb},0.75)`;
+    ctx.lineWidth = reinforced ? 3.5 : 2;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, HUB_RADIUS, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
     ctx.stroke();
 
-    ctx.strokeStyle = "rgba(127,224,141,0.35)";
+    ctx.strokeStyle = `rgba(${rgb},0.35)`;
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, HUB_RADIUS * 0.6, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, radius * 0.6, 0, Math.PI * 2);
     ctx.stroke();
 
-    ctx.fillStyle = "rgba(127,224,141,0.9)";
+    ctx.fillStyle = `rgba(${rgb},0.9)`;
     ctx.beginPath();
     ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
     ctx.fill();
 
+    if (reinforced) {
+      ctx.strokeStyle = `rgba(${rgb},0.5)`;
+      ctx.lineWidth = 1.5;
+      for (let i = 0; i < 12; i++) {
+        const a = (i / 12) * Math.PI * 2;
+        const inner = add(p, scale(fromAngle(a), radius - 5));
+        const outer = add(p, scale(fromAngle(a), radius + 5));
+        ctx.beginPath();
+        ctx.moveTo(inner.x, inner.y);
+        ctx.lineTo(outer.x, outer.y);
+        ctx.stroke();
+      }
+    }
+
+    // Beacon Range Upgrade — a pulsing light; a bigger beaconRange pulses a little slower/broader.
+    if (hub.beaconRange > 0) {
+      const beaconPos = add(p, scale(fromAngle((HUB_BEACON_ANGLE_DEG * Math.PI) / 180), radius));
+      const speed = Math.max(0.6, 3 - hub.beaconRange / 800);
+      const pulse = 0.5 + 0.5 * Math.sin(time * speed);
+      ctx.fillStyle = `rgba(255,220,140,${0.4 + 0.5 * pulse})`;
+      ctx.beginPath();
+      ctx.arc(beaconPos.x, beaconPos.y, 3 + pulse * 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Repair Bay — a small lit cross panel. Nothing can damage the hub yet, but the med-bay
+    // fiction reads fine as a pure "you're safe here" tell regardless.
+    if (hub.repairOnDock) {
+      const rp = add(p, scale(fromAngle((HUB_REPAIR_BAY_ANGLE_DEG * Math.PI) / 180), radius));
+      ctx.fillStyle = "rgba(20,30,25,0.85)";
+      ctx.fillRect(rp.x - 5, rp.y - 5, 10, 10);
+      ctx.strokeStyle = "rgba(255,120,120,0.85)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(rp.x - 3, rp.y);
+      ctx.lineTo(rp.x + 3, rp.y);
+      ctx.moveTo(rp.x, rp.y - 3);
+      ctx.lineTo(rp.x, rp.y + 3);
+      ctx.stroke();
+    }
+
     if (engine.nearHub) {
+      // hub.dockRange is now a passive function of facilitiesBuilt (hub.ts), not a purchasable
+      // stat — this ring already grows on its own as the hub does, no separate "upgrade bought"
+      // visual needed alongside it.
       ctx.strokeStyle = "rgba(127,224,141,0.6)";
       ctx.lineWidth = 1.5;
       ctx.beginPath();
-      ctx.arc(p.x, p.y, HUB_DOCK_RANGE, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, hub.dockRange, 0, Math.PI * 2);
       ctx.stroke();
 
       ctx.font = "bold 13px monospace";
       ctx.fillStyle = "#7de08d";
       ctx.textAlign = "center";
-      ctx.fillText("[F] DOCK", p.x, p.y - HUB_RADIUS - 16);
+      ctx.fillText("[F] DOCK", p.x, p.y - radius - 16);
       ctx.textAlign = "left";
+    }
+  }
+
+  /** Baseline, unlocked from the start — main spec Section 2 has always said the hub is
+   *  solar-powered, but nothing ever drew it. Two panels flanking the hub, angled to face
+   *  HOME_STAR_POS — since both are fixed points this angle never changes frame to frame, but
+   *  it's still computed live rather than hardcoded so it stays correct if the hub ever moves. */
+  private renderHubSolarArrays(ctx: CanvasRenderingContext2D, hubScreenPos: Vec2) {
+    const starAngle = Math.atan2(HOME_STAR_POS.y - hubScreenPos.y, HOME_STAR_POS.x - hubScreenPos.x);
+    const perp = starAngle + Math.PI / 2;
+    const armLen = HUB_RADIUS * 0.55;
+    for (const side of [1, -1]) {
+      const base = add(hubScreenPos, scale(fromAngle(perp), side * HUB_RADIUS * 0.5));
+      ctx.save();
+      ctx.translate(base.x, base.y);
+      ctx.rotate(starAngle);
+      ctx.fillStyle = "rgba(90,140,220,0.5)";
+      ctx.fillRect(0, -6, armLen, 12);
+      ctx.strokeStyle = "rgba(150,190,255,0.5)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(0, -6, armLen, 12);
+      ctx.restore();
+    }
+  }
+
+  /** A dark, unfilled clamp stub at a not-yet-built facility's reserved slot — environmental
+   *  storytelling that the hub was designed for more than currently exists, not just an absence. */
+  private renderHubModuleStub(ctx: CanvasRenderingContext2D, center: Vec2, radius: number, angleDeg: number) {
+    const angle = (angleDeg * Math.PI) / 180;
+    const inner = add(center, scale(fromAngle(angle), radius));
+    const outer = add(center, scale(fromAngle(angle), radius + HUB_MODULE_OFFSET * 0.5));
+    ctx.strokeStyle = "rgba(120,130,145,0.25)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(inner.x, inner.y);
+    ctx.lineTo(outer.x, outer.y);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(outer.x, outer.y, 5, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  /** An owned Hub Facility's module — a strut back to the ring, then a kind-specific shape drawn
+   *  in its own local frame (translated/rotated so "local up" points outward along the strut).
+   *  Each kind's shape/animation says what the facility does (hub-growth-spec.md Section 3)
+   *  rather than being a reskinned copy of the others. All animation is a fixed-period cosmetic
+   *  read off `time` alone (deliberately not wired to real solar/detection state — see the
+   *  spec's own scope-discipline note on why that coupling isn't worth it). */
+  private renderHubModule(
+    ctx: CanvasRenderingContext2D,
+    center: Vec2,
+    ringRadius: number,
+    slot: HubModuleSlot,
+    hub: Hub,
+    satelliteCount: number,
+    time: number,
+  ) {
+    const angle = (slot.angleDeg * Math.PI) / 180;
+    const modulePos = add(center, scale(fromAngle(angle), ringRadius + HUB_MODULE_OFFSET));
+    const strutInner = add(center, scale(fromAngle(angle), ringRadius));
+
+    ctx.strokeStyle = "rgba(180,190,200,0.35)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(strutInner.x, strutInner.y);
+    ctx.lineTo(modulePos.x, modulePos.y);
+    ctx.stroke();
+
+    ctx.save();
+    ctx.translate(modulePos.x, modulePos.y);
+    ctx.rotate(angle + Math.PI / 2);
+    switch (slot.kind) {
+      case "researchLab":
+        this.renderResearchLabModule(ctx, slot.rgb, !!hub.activeResearch, time);
+        break;
+      case "observatory":
+        this.renderObservatoryModule(ctx, slot.rgb, time);
+        break;
+      case "satelliteBay":
+        this.renderSatelliteBayModule(ctx, slot.rgb, hub.satelliteCap, satelliteCount);
+        break;
+      case "reactor":
+        this.renderReactorModule(ctx, slot.rgb, time);
+        break;
+      case "refinery":
+        this.renderRefineryModule(ctx, slot.rgb, time);
+        break;
+    }
+    ctx.restore();
+  }
+
+  private renderResearchLabModule(ctx: CanvasRenderingContext2D, rgb: string, sweeping: boolean, time: number) {
+    ctx.strokeStyle = `rgba(${rgb},0.7)`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, 9);
+    ctx.lineTo(0, -4);
+    ctx.stroke();
+
+    ctx.save();
+    ctx.rotate(sweeping ? Math.sin(time * 1.6) * 0.4 : 0);
+    ctx.strokeStyle = `rgba(${rgb},0.85)`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(0, -4, 8, Math.PI * 0.15, Math.PI * 0.85);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  private renderObservatoryModule(ctx: CanvasRenderingContext2D, rgb: string, time: number) {
+    ctx.fillStyle = `rgba(${rgb},0.25)`;
+    ctx.strokeStyle = `rgba(${rgb},0.7)`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(0, 4, 11, Math.PI, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    const sweepAngle = Math.PI + (time * 0.6 - Math.floor(time * 0.6)) * Math.PI;
+    ctx.strokeStyle = `rgba(${rgb},0.5)`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, 4);
+    ctx.lineTo(Math.cos(sweepAngle) * 10, 4 + Math.sin(sweepAngle) * 10);
+    ctx.stroke();
+  }
+
+  private renderSatelliteBayModule(ctx: CanvasRenderingContext2D, rgb: string, cap: number, count: number) {
+    ctx.strokeStyle = `rgba(${rgb},0.6)`;
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(-10, -6, 20, 12);
+
+    const n = Math.max(1, cap);
+    for (let i = 0; i < n; i++) {
+      const x = n === 1 ? 0 : -8 + (i / (n - 1)) * 16;
+      ctx.fillStyle = i < count ? `rgba(${rgb},0.95)` : `rgba(${rgb},0.25)`;
+      ctx.beginPath();
+      ctx.arc(x, 0, 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  private renderReactorModule(ctx: CanvasRenderingContext2D, rgb: string, time: number) {
+    const pulse = 0.55 + 0.35 * Math.sin(time * 1.2);
+    ctx.fillStyle = `rgba(${rgb},${pulse})`;
+    ctx.beginPath();
+    ctx.arc(0, 0, 7, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = `rgba(${rgb},0.55)`;
+    ctx.lineWidth = 1.5;
+    const finSpin = time * 0.5;
+    for (let i = 0; i < 3; i++) {
+      const a = finSpin + (i / 3) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * 9, Math.sin(a) * 9);
+      ctx.lineTo(Math.cos(a) * 16, Math.sin(a) * 16);
+      ctx.stroke();
+    }
+  }
+
+  private renderRefineryModule(ctx: CanvasRenderingContext2D, rgb: string, time: number) {
+    ctx.fillStyle = "rgba(70,64,58,0.85)";
+    ctx.strokeStyle = `rgba(${rgb},0.5)`;
+    ctx.lineWidth = 1.5;
+    ctx.fillRect(-9, -8, 18, 16);
+    ctx.strokeRect(-9, -8, 18, 16);
+
+    for (let i = 0; i < 3; i++) {
+      const flicker = 0.3 + 0.35 * Math.abs(Math.sin(time * (2.2 + i * 0.7) + i));
+      ctx.fillStyle = `rgba(${rgb},${flicker})`;
+      ctx.beginPath();
+      ctx.arc(-4 + i * 4, 2, 3, 0, Math.PI * 2);
+      ctx.fill();
     }
   }
 
@@ -384,19 +724,37 @@ export class Renderer {
     if (!hover) return;
 
     let label: string;
+    let labelColor = "rgba(230,232,238,0.85)";
     if (hover.kind === "cell") {
       this.strokePolygon(ctx, toScreen, hover.cell.polygon, "#ffffff", 2);
       label = hover.cell.asteroid.scanned ? COMPOSITION_INFO[hover.cell.composition].label : "unidentified";
     } else {
       // Chunks are small and already visually distinct (loose debris drifting on its own) —
       // an outline circle around them just added clutter. Tooltip only.
-      label = COMPOSITION_INFO[hover.chunk.composition].label;
+      // Shows the chunk's actual weight (real kg, driven by size and material density — see
+      // weightKgFor) plus whether it'll actually fit — flying over a chunk heavier than
+      // remaining cargo room only collects the part that fits and wastes the rest (see the
+      // chunk-pickup loop in Engine.update), so this is the one place that's visible before
+      // committing to grab it.
+      const { chunk } = hover;
+      const info = COMPOSITION_INFO[chunk.composition];
+      const chunkWeightKg = weightKgFor(chunk.composition, chunk.value);
+      const roomKg = engine.ship.cargoCapacity - engine.ship.cargoUsed;
+      if (roomKg <= 0) {
+        label = `${info.label} (${Math.round(chunkWeightKg)}kg) — CARGO FULL, WON'T COLLECT`;
+        labelColor = "rgba(255,107,107,0.9)";
+      } else if (roomKg < chunkWeightKg) {
+        label = `${info.label} (${Math.round(chunkWeightKg)}kg) — ONLY ${Math.round(roomKg)}kg WILL FIT`;
+        labelColor = "rgba(255,207,92,0.9)";
+      } else {
+        label = `${info.label} (${Math.round(chunkWeightKg)}kg)`;
+      }
     }
 
     const cursor = toScreen(engine.screenToWorld(engine.input.mouseScreen));
     ctx.font = "11px monospace";
     ctx.textAlign = "left";
-    ctx.fillStyle = "rgba(230,232,238,0.85)";
+    ctx.fillStyle = labelColor;
     ctx.fillText(label, cursor.x + 14, cursor.y - 12);
   }
 
@@ -587,6 +945,14 @@ export class Renderer {
     const alpha = staleFor <= 0 ? 1 : Math.max(0, 1 - staleFor / CONTACT_FADE_DURATION);
     if (alpha <= 0) return;
 
+    // Tactical-radar-only range cutoff — the underlying memory can now live much longer (see
+    // MAP_CONTACT_FORGET_AFTER, read by the hub's Map tab), but the in-field HUD radar only ever
+    // shows what's still plausibly nearby, same as before this split. Self-owned, always-known
+    // assets (the hub, any deployed satellite) are exempt — you don't lose track of home, or of
+    // something you placed yourself, just because you flew far away from it.
+    const alwaysKnown = contact.kind === "hub" || contact.kind === "satellite";
+    if (!alwaysKnown && distance(ship.pos, contact.pos) > CONTACT_MAX_RANGE) return;
+
     const center = v2(width / 2, height / 2);
     const dir = normalize(sub(screenPos, center));
     const maxX = width / 2 - margin;
@@ -601,14 +967,17 @@ export class Renderer {
     // Engine.identifiedContacts); the hub is the one thing you start out already knowing.
     // Unidentified contacts read as a neutral, uninformative color on purpose — the color coding
     // itself (hub green, star amber) would otherwise leak what something is before it's earned.
-    const identified = contact.kind === "hub" || engine.identifiedContacts.has(contact.id);
+    const identified =
+      contact.kind === "hub" || contact.kind === "satellite" || engine.identifiedContacts.has(contact.id);
     const rgb = !identified
       ? "170,180,190"
       : contact.kind === "hub"
         ? "127,224,141"
         : contact.kind === "star"
           ? "255,190,110"
-          : "127,224,255";
+          : contact.kind === "satellite"
+            ? "200,160,255"
+            : "127,224,255";
 
     ctx.save();
     ctx.translate(pos.x, pos.y);
@@ -667,6 +1036,12 @@ export class Renderer {
     ctx.fillText(`MODE: ${ship.mode.toUpperCase()}${modeSuffix}`, panelX, y);
     y += lineH + 2;
 
+    // m/s — 1 world unit is 1 meter (same convention the rest of the HUD/coords use). Bar is
+    // normalized against cruise's own terminal speed, not a hard cap — gravity/collision/blast
+    // knockback can genuinely exceed it, the bar just clamps visually past 100% when they do.
+    const speed = length(ship.vel);
+    bar("SPEED", speed / CRUISE_TERMINAL_SPEED, "#a0e0ff", ` ${speed.toFixed(0)}m/s`);
+
     bar("HULL", ship.hull / 100, ship.hull > 30 ? "#7de08d" : "#ff6b6b", ` ${ship.hull.toFixed(0)}/100`);
     // Only shown once it means something — no clutter when nowhere near a heat source.
     if (ship.temperature > 1) {
@@ -678,8 +1053,32 @@ export class Renderer {
         ` ${ship.temperature.toFixed(0)}%${overheating ? " — OVERHEATING" : ""}`,
       );
     }
-    bar("CARGO", ship.cargoUsed / ship.cargoCapacity, "#7fe0ff", ` ${ship.cargoUsed}/${ship.cargoCapacity}`);
+    bar(
+      "CARGO",
+      ship.cargoUsed / ship.cargoCapacity,
+      "#7fe0ff",
+      ` ${Math.round(ship.cargoUsed)}/${ship.cargoCapacity}kg`,
+    );
     bar("SIGNATURE", ship.signature / 100, "#ffa25c", ` ${ship.signature.toFixed(0)}%`);
+
+    // Fuel: thrust-only, never regenerates passively — red once low, since running out means
+    // real stranding (fuel-power-spec.md Section 4), not just an inconvenience.
+    bar(
+      "FUEL",
+      ship.fuel / ship.fuelCapacity,
+      ship.fuel > ship.fuelCapacity * 0.2 ? "#ffcf5c" : "#ff6b6b",
+      ` ${ship.fuel.toFixed(0)}/${ship.fuelCapacity.toFixed(0)}`,
+    );
+    // Battery: everything except thrust. A distinct warm tint + marker while within the star's
+    // (much larger than its hazard radii) solar range and actually gaining charge from it — the
+    // one place the risk/reward of hugging the star pays off outside of pure heat-tolerance.
+    const solarCharging = distance(ship.pos, HOME_STAR_POS) < HOME_STAR_SOLAR_RADIUS;
+    bar(
+      "BATTERY",
+      ship.battery / ship.batteryCapacity,
+      solarCharging ? "#ffe08a" : "#7fe0ff",
+      ` ${ship.battery.toFixed(0)}/${ship.batteryCapacity.toFixed(0)}${solarCharging ? " (charging)" : ""}`,
+    );
 
     y += 4;
     ctx.font = "12px monospace";
@@ -692,6 +1091,12 @@ export class Renderer {
     const pingText = engine.pingCooldown > 0 ? `cooling ${engine.pingCooldown.toFixed(1)}s` : "READY";
     ctx.fillText(`PING [Q]: ${pingText}`, panelX, y);
     y += lineH;
+
+    // Only shown once Observatory is built — no point advertising a key that does nothing yet.
+    if (engine.hub.observatoryBuilt) {
+      ctx.fillText(`SATELLITE [G]: ${engine.satellites.length}/${engine.hub.satelliteCap} deployed`, panelX, y);
+      y += lineH;
+    }
 
     // Galactic standard coordinate, not raw (x, y) — see coords.ts. Star-anchored, not
     // ship-relative, so it stays meaningful for a future map rather than just "which way to
@@ -732,10 +1137,14 @@ export class Renderer {
       y += 2;
       ctx.fillStyle = "#8f97a3";
       ctx.font = "11px monospace";
-      ctx.fillText("SCAN DATA — composition remaining in the nearest body", panelX, y);
+      ctx.fillText(`SCAN DATA — ${ASTEROID_TYPE_INFO[asteroid.type].label}`, panelX, y);
       y += 15;
-      const compositions: Cell["composition"][] = ["ore", "crystal", "unstable"];
-      for (const comp of compositions) {
+      // Only resources this asteroid's type can actually contain (see RESOURCE_WEIGHTS_BY_TYPE)
+      // — showing all six unconditionally would list e.g. Platinum-Group Ore as "0 intact" on a
+      // body that could never have had any, which reads as a find that's been missed rather
+      // than one that was never possible here.
+      const possible = COMPOSITIONS.filter((c) => RESOURCE_WEIGHTS_BY_TYPE[asteroid.type][c] > 0);
+      for (const comp of possible) {
         const info = COMPOSITION_INFO[comp];
         const remaining = asteroid.cells.filter((c) => !c.fractured && c.composition === comp).length;
         ctx.fillStyle = "#cfd6e0";

@@ -1,6 +1,6 @@
 import { Vec2, add, scale, v2 } from "./vec2";
-import { CHUNK_DRAG, ROCK_MASS_PER_AREA } from "./constants";
-import { Composition } from "./asteroid";
+import { CHUNK_DRAG } from "./constants";
+import { Composition, massForArea } from "./asteroid";
 
 let nextChunkId = 1;
 
@@ -42,11 +42,14 @@ export class Chunk {
     this.angle += this.spin * dt;
   }
 
-  /** A chunk is the same material it broke off from, just no longer part of a larger body —
-   *  so it shares the asteroid's density constant (`ROCK_MASS_PER_AREA`) rather than having
-   *  its own disconnected mass convention. Approximated as a circle of `radius` since chunk
-   *  shape is cosmetic (an irregular outline generated only for rendering). */
+  /** A chunk is the same material it broke off from, just no longer part of a larger body — so
+   *  it goes through the exact same `massForArea` every cell/group in the asteroid it came from
+   *  uses (asteroid.ts), rather than a second, disconnected mass convention. A Nickel-Iron chunk
+   *  is exactly as heavy after extraction as the cell it was cut from, and genuinely harder to
+   *  shove around than a Water Ice chunk of the same size — same as its cargo weight is.
+   *  Approximated as a circle of `radius` since chunk shape is cosmetic (an irregular outline
+   *  generated only for rendering). */
   get mass(): number {
-    return Math.max(1, Math.PI * this.radius * this.radius * ROCK_MASS_PER_AREA);
+    return Math.max(1, massForArea(this.composition, Math.PI * this.radius * this.radius));
   }
 }

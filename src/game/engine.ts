@@ -1,12 +1,16 @@
 import { InputState } from "./input";
-import { DamageSource, Ship } from "./ship";
+import { CargoHold, DamageSource, Ship, emptyCargo } from "./ship";
 import {
-  ASTEROID_ARCHETYPES,
   Asteroid,
+  AsteroidType,
   Cell,
   COMPOSITION_INFO,
+  COMPOSITIONS,
   CrackSegment,
   cellWorldToLocal,
+  chunkValueForArea,
+  massForArea,
+  massPerAreaFor,
   scanSecondsForRadius,
   sizeLabelForRadius,
 } from "./asteroid";
@@ -14,11 +18,13 @@ import { BodyHandle } from "./body";
 import { Chunk } from "./chunk";
 import { Contact, ContactKind, ContactMemory } from "./contacts";
 import { Explosion } from "./explosion";
-import { GravitySource, gravityAccel, radiantHeatExposure } from "./gravity";
+import { GravitySource, gravityAccel, radiantHeatExposure, solarExposure } from "./gravity";
 import { HoverTarget } from "./hover";
 import { Hub } from "./hub";
+import { weightedPick } from "./random";
+import { RESEARCH, ResearchId } from "./research";
 import { TOOLS, ToolId } from "./tools";
-import { UPGRADES, UpgradeId, canAfford } from "./upgrades";
+import { HubStatKey, REFINE_RECIPES, RefineRecipeId, ShipStatKey, UPGRADES, UpgradeId, canAfford } from "./upgrades";
 import {
   BoundaryHit,
   boundingRadius,
@@ -36,6 +42,8 @@ import { Material, RigidRef, applyFriction, applyPointImpulse, combineMaterials,
 import {
   ANGULAR_DAMPING,
   ASTEROID_SIZE_CLASSES,
+  BATTERY_BASELINE_REGEN_PER_SEC,
+  BATTERY_SOLAR_REGEN_MULT,
   BELT_ASTEROID_COUNT,
   BELT_DRIFT_CHANCE,
   BELT_DRIFT_SPEED,
@@ -50,13 +58,10 @@ import {
   CHARGE_BLAST_RADIUS,
   CHARGE_CHUNK_PUSH_MAX,
   CHARGE_IMPULSE_PER_CHARGE,
-  CHARGE_MAX_CARRIED,
   CHUNK_COLLECT_RADIUS,
   CHUNK_FRICTION,
   CHUNK_RESTITUTION,
   COLLISION_SUBSTEP_TRAVEL,
-  CONTACT_FORGET_AFTER,
-  CONTACT_MAX_RANGE,
   DEATH_SCREEN_DURATION,
   DRIFT_DAMPING,
   DRILL_ANCHOR_RANGE,
@@ -66,12 +71,13 @@ import {
   HOME_STAR_PULL_RADIUS,
   HOME_STAR_PULL_STRENGTH,
   HOME_STAR_RADIUS,
+  HOME_STAR_SOLAR_INTENSITY,
+  HOME_STAR_SOLAR_RADIUS,
   HOVER_CHUNK_PADDING,
-  HUB_DOCK_RANGE,
-  HUB_RADIUS,
   LASER_CUT_DEPTH,
+  MAP_CONTACT_FORGET_AFTER,
+  MAP_SECTOR_SIZE,
   MAX_COLLISION_SUBSTEPS,
-  MAX_HULL,
   MIN_CELL_AREA,
   NEAR_HUB_ROCK_COUNT,
   NEAR_HUB_ROCK_RADIUS,
@@ -80,27 +86,29 @@ import {
   NORMAL_AREA_OUTER_RADIUS,
   NORMAL_AREA_SIZE_POOL,
   NORMAL_AREA_TINY_ROCK_COUNT,
+  PASSIVE_PING_POWER_COST,
+  PASSIVE_PING_RADIUS,
   PING_COOLDOWN,
-  PING_MAX_RADIUS,
-  PING_SPEED,
+  PING_POWER_COST,
   POSITION_CORRECTION_RATE,
+  POWERLESS_VISION_RADIUS,
+  REACTOR_DOCK_SOLAR_BOOST,
   ROCK_CONTACT_MIN_CLOSING_SPEED,
   ROCK_FRICTION,
-  ROCK_MASS_PER_AREA,
   ROCK_RESTITUTION,
+  SATELLITE_DEPLOY_COST,
+  SATELLITE_VISION_RADIUS,
+  SCAN_POWER_DRAW_PER_SEC,
   SCAN_PROGRESS_DECAY,
   SCAN_RANGE,
   SHIP_FRICTION,
-  SHIP_MASS,
   SHIP_RADIUS,
   SHIP_RESTITUTION,
-  SIGNATURE_DECAY_PER_SEC,
-  TEMPERATURE_DAMAGE_THRESHOLD,
   TEMPERATURE_MAX_DAMAGE_PER_SEC,
+  VISION_POWER_DRAW_PER_SEC,
   TINY_ROCK_RADIUS,
   TOOL_OFF_MULT,
   TOOL_RECOMMENDED_MULT,
-  VISION_RADIUS,
   COLLISION_DAMAGE_SCALE,
   COLLISION_MIN_SPEED,
 } from "./constants";
@@ -136,15 +144,31 @@ interface DriftGroup {
   angularVelocity: number;
 }
 
+/** A player-deployed fixed-position sensor source (map-radar-spec.md Section 6) — no physics, no
+ *  drift, not mineable, just a point with a vision-style radius. `id` doubles as its Contact id. */
+interface Satellite {
+  id: string;
+  pos: Vec2;
+}
+
 const TOOL_ORDER: ToolId[] = ["laser", "drill", "charges"];
 const SPAWN_POS: Vec2 = v2(0, 0);
 let nextGroupId = 1;
+let nextSatelliteId = 1;
+const SATELLITE_DEPLOY_COST_FULL: CargoHold = { ...emptyCargo(), ...SATELLITE_DEPLOY_COST };
 
 // Each collidable kind's own material, defined once — see physics.ts's combineMaterials for
 // how a pair's actual bounce/grip is derived from these rather than hand-tuned per pairing.
 const SHIP_MATERIAL: Material = { restitution: SHIP_RESTITUTION, friction: SHIP_FRICTION };
 const ROCK_MATERIAL: Material = { restitution: ROCK_RESTITUTION, friction: ROCK_FRICTION };
 const CHUNK_MATERIAL: Material = { restitution: CHUNK_RESTITUTION, friction: CHUNK_FRICTION };
+
+// Which asteroid type (see asteroid.ts's RESOURCE_WEIGHTS_BY_TYPE) a newly spawned body in a
+// given zone is likely to be — twin-star-spec.md Section 17: normal space stays overwhelmingly
+// S-type (safe, unremarkable), the belt ring is where real type variety — and therefore
+// Platinum-Group Ore, Water Ice, and Radioactive Ore — actually becomes findable.
+const NORMAL_AREA_TYPE_WEIGHTS: Record<AsteroidType, number> = { S: 0.85, C: 0.1, M: 0.03, Icy: 0.02 };
+const BELT_TYPE_WEIGHTS: Record<AsteroidType, number> = { S: 0.45, C: 0.25, M: 0.2, Icy: 0.1 };
 
 export class Engine {
   ship: Ship;
@@ -168,12 +192,24 @@ export class Engine {
   pingActive = false;
   pingRadius = 0;
   pingCooldown = 0;
+  // Passive Ping (upgrades.ts) — an automatic, weaker sweep on its own timer, independent of the
+  // manual Q ping above. Gated by ship.passivePingInterval > 0 (0 = not unlocked); see update().
+  private passivePingTimer = 0;
   discoveredContacts = new Map<string, ContactMemory>(); // read by Renderer for radar blips
+  // Fog of war (map-radar-spec.md) — coarse grid cells ("sx,sy" keys, MAP_SECTOR_SIZE each) any
+  // sensor source has ever swept. Permanent once set — read by the hub's Map tab, not rendered
+  // in the field at all (the map is hub-only, see markExplored's own doc comment).
+  exploredSectors = new Set<string>();
+  // Player-deployed fixed sensor sources (Observatory-gated) — see deploySatellite/sensorSources.
+  satellites: Satellite[] = [];
   // A contact's *identity* (what it actually is), separate from just knowing it's out there —
   // only populated by real close-range vision, never by ping alone (see update()'s sensor
   // block), and never removed once set: having actually seen something isn't something you
   // forget just because you've since lost track of where it is.
   identifiedContacts = new Set<string>();
+  // Discovery gate for ResearchDef.requiresScannedType (research.ts) — every AsteroidType ever
+  // scanned, regardless of whether it was ever mined. Persists across death like identifiedContacts.
+  scannedTypes = new Set<AsteroidType>();
 
   message: FlashMessage | null = null;
   private cargoFullMessageCooldown = 0;
@@ -206,9 +242,7 @@ export class Engine {
 
   constructor(canvas: HTMLCanvasElement) {
     this.input = new InputState(canvas);
-    // TEMP: spawning inside the (now star-anchored) belt ring on request, just to look at it —
-    // hub stays put. Revert to `new Ship(SPAWN_POS)` when done.
-    this.ship = new Ship(add(HOME_STAR_POS, fromAngle(-Math.PI / 2, (BELT_INNER_RADIUS + BELT_OUTER_RADIUS) / 2)));
+    this.ship = new Ship(SPAWN_POS);
     this.hub = new Hub({ ...SPAWN_POS });
     this.asteroids = this.scatterSystem();
     this.gravitySources = [
@@ -223,6 +257,11 @@ export class Engine {
         // Shares the pull radius — if you're being pulled in, you're already in the heat too.
         heatRadius: HOME_STAR_PULL_RADIUS,
         heatIntensity: HOME_STAR_HEAT_INTENSITY,
+        // Deliberately a much bigger radius than the pull/heat above — see gravity.ts's
+        // GravitySource doc comment and fuel-power-spec.md: sunlight is useful far past any
+        // hazard the star itself poses.
+        solarRadius: HOME_STAR_SOLAR_RADIUS,
+        solarIntensity: HOME_STAR_SOLAR_INTENSITY,
       },
     ];
   }
@@ -247,7 +286,13 @@ export class Engine {
 
     for (let i = 0; i < BELT_ASTEROID_COUNT; i++) {
       const sizeClass = ASTEROID_SIZE_CLASSES[BELT_SIZE_POOL[Math.floor(Math.random() * BELT_SIZE_POOL.length)]];
-      asteroids.push(this.spawnSystemBody(sizeClass.min, sizeClass.max, { origin: HOME_STAR_POS, distRange: beltRange }));
+      asteroids.push(
+        this.spawnSystemBody(sizeClass.min, sizeClass.max, {
+          origin: HOME_STAR_POS,
+          distRange: beltRange,
+          typeWeights: BELT_TYPE_WEIGHTS,
+        }),
+      );
     }
     for (let i = 0; i < BELT_TINY_ROCK_COUNT; i++) {
       asteroids.push(
@@ -255,6 +300,7 @@ export class Engine {
           seedCount: 1,
           origin: HOME_STAR_POS,
           distRange: beltRange,
+          typeWeights: BELT_TYPE_WEIGHTS,
         }),
       );
     }
@@ -262,7 +308,13 @@ export class Engine {
     for (let i = 0; i < NORMAL_AREA_ASTEROID_COUNT; i++) {
       const sizeClass =
         ASTEROID_SIZE_CLASSES[NORMAL_AREA_SIZE_POOL[Math.floor(Math.random() * NORMAL_AREA_SIZE_POOL.length)]];
-      asteroids.push(this.spawnSystemBody(sizeClass.min, sizeClass.max, { origin: HOME_STAR_POS, distRange: normalRange }));
+      asteroids.push(
+        this.spawnSystemBody(sizeClass.min, sizeClass.max, {
+          origin: HOME_STAR_POS,
+          distRange: normalRange,
+          typeWeights: NORMAL_AREA_TYPE_WEIGHTS,
+        }),
+      );
     }
     for (let i = 0; i < NORMAL_AREA_TINY_ROCK_COUNT; i++) {
       asteroids.push(
@@ -270,6 +322,7 @@ export class Engine {
           seedCount: 1,
           origin: HOME_STAR_POS,
           distRange: normalRange,
+          typeWeights: NORMAL_AREA_TYPE_WEIGHTS,
         }),
       );
     }
@@ -280,6 +333,7 @@ export class Engine {
           seedCount: 1,
           origin: this.hub.pos,
           distRange: NEAR_HUB_ROCK_RADIUS,
+          typeWeights: NORMAL_AREA_TYPE_WEIGHTS,
         }),
       );
     }
@@ -289,14 +343,19 @@ export class Engine {
   private spawnSystemBody(
     minRadius: number,
     maxRadius: number,
-    options: { seedCount?: number; distRange: { min: number; max: number }; origin: Vec2 },
+    options: {
+      seedCount?: number;
+      distRange: { min: number; max: number };
+      origin: Vec2;
+      typeWeights: Record<AsteroidType, number>;
+    },
   ): Asteroid {
     const angle = Math.random() * Math.PI * 2;
     const dist = options.distRange.min + Math.random() * (options.distRange.max - options.distRange.min);
     const center = add(options.origin, fromAngle(angle, dist));
 
     const radius = minRadius + Math.random() * (maxRadius - minRadius);
-    const compositionWeights = ASTEROID_ARCHETYPES[Math.floor(Math.random() * ASTEROID_ARCHETYPES.length)];
+    const type = weightedPick(options.typeWeights, Math.random());
 
     // Most bodies start fully at rest — a fraction get a small initial drift instead, just
     // enough that the field doesn't read as a frozen diagram.
@@ -305,7 +364,7 @@ export class Engine {
         ? fromAngle(Math.random() * Math.PI * 2, BELT_DRIFT_SPEED.min + Math.random() * (BELT_DRIFT_SPEED.max - BELT_DRIFT_SPEED.min))
         : undefined;
 
-    return new Asteroid(center, Math.random, { radius, compositionWeights, seedCount: options.seedCount, initialVelocity });
+    return new Asteroid(center, Math.random, { radius, type, seedCount: options.seedCount, initialVelocity });
   }
 
   dispose() {
@@ -338,6 +397,11 @@ export class Engine {
       return;
     }
 
+    // Research (research.ts) ticks regardless of scene — "meanwhile, back at the hub" is the
+    // whole point (twin-star-spec.md Section 9's long-flagged passive layer), not something
+    // that only progresses while docked and staring at it.
+    this.updateResearch(dt);
+
     if (this.scene === "hub") {
       this.updateHub(dt);
       input.endFrame();
@@ -348,6 +412,10 @@ export class Engine {
 
     if (input.wasJustPressed(" ")) ship.toggleMode();
     if (input.wasJustPressed("tab")) this.cycleTool();
+    // DEV-ONLY — see debugMaxHub's own doc comment. Bound here (field scene) rather than the hub
+    // screen since the actual payoff (the grown ring + facility modules) only renders out in the
+    // field, looking at the hub from outside.
+    if (input.wasJustPressed("0")) this.debugMaxHub();
 
     // Move every rock body first, so collision this frame resolves against
     // where it actually is now rather than lagging a frame behind. Rock-vs-rock
@@ -368,7 +436,7 @@ export class Engine {
     const shipSteps = this.substepsFor(length(ship.vel), dt);
     const shipSubDt = dt / shipSteps;
     for (let s = 0; s < shipSteps; s++) {
-      this.applyGravityTo(ship, shipSubDt);
+      this.applyGravityTo(ship, shipSubDt, ship.gravityResistMult);
       const stepMouse = this.screenToWorld(input.mouseScreen);
       ship.updateMovement(shipSubDt, input, stepMouse);
       if (this.lethalGravityContact(ship.pos)) {
@@ -378,16 +446,17 @@ export class Engine {
 
       // Heat is a two-stage threat from the same wells: exposure always raises temperature (a
       // visible warning — see Ship.temperature), but only once temperature crosses
-      // TEMPERATURE_DAMAGE_THRESHOLD does it actually start costing hull, escalating toward
-      // TEMPERATURE_MAX_DAMAGE_PER_SEC at full overheat. Touching the surface is still
-      // unconditionally instant death regardless of temperature — this is a separate, gentler
-      // threat for lingering nearby, not a replacement for it.
+      // ship.temperatureDamageThreshold (upgradable — Heat Shield) does it actually start
+      // costing hull, escalating toward TEMPERATURE_MAX_DAMAGE_PER_SEC at full overheat.
+      // Touching the surface is still unconditionally instant death regardless of temperature —
+      // this is a separate, gentler threat for lingering nearby, not a replacement for it.
       const exposure = this.totalRadiantHeatExposure(ship.pos);
-      const wasOverheating = ship.temperature > TEMPERATURE_DAMAGE_THRESHOLD;
+      const wasOverheating = ship.temperature > ship.temperatureDamageThreshold;
       ship.updateTemperature(exposure, shipSubDt);
-      if (ship.temperature > TEMPERATURE_DAMAGE_THRESHOLD) {
+      if (ship.temperature > ship.temperatureDamageThreshold) {
         if (!wasOverheating) this.setMessage("HULL TEMPERATURE CRITICAL", "#ff8f6b");
-        const overheatFrac = (ship.temperature - TEMPERATURE_DAMAGE_THRESHOLD) / (100 - TEMPERATURE_DAMAGE_THRESHOLD);
+        const overheatFrac =
+          (ship.temperature - ship.temperatureDamageThreshold) / (100 - ship.temperatureDamageThreshold);
         ship.takeImpact(overheatFrac * TEMPERATURE_MAX_DAMAGE_PER_SEC * shipSubDt, "heat");
         if (ship.hull <= 0) {
           this.handleShipDestroyed("BURNED UP");
@@ -413,10 +482,11 @@ export class Engine {
     // What's "discovered" is a snapshot, not a live link: it ages and is eventually
     // forgotten if nothing refreshes it, so radar reflects what you actually know.
     this.pingCooldown = Math.max(0, this.pingCooldown - dt);
-    if (input.wasJustPressed("q") && this.pingCooldown <= 0) {
+    if (input.wasJustPressed("q") && this.pingCooldown <= 0 && ship.powered) {
       this.pingActive = true;
       this.pingRadius = 0;
       this.pingCooldown = PING_COOLDOWN;
+      ship.applyPowerDelta(-PING_POWER_COST * ship.powerDrawMult);
     }
     const contacts = this.getContacts();
     for (const memory of this.discoveredContacts.values()) memory.age += dt;
@@ -427,9 +497,17 @@ export class Engine {
     // Refreshed every frame so it never goes stale/forgotten the way a real discovery does.
     const hubContact = this.hubContact();
     this.discoveredContacts.set(hubContact.id, { contact: hubContact, age: 0 });
+    // Satellites are the same "you don't have to find it, you put it there" case as the hub —
+    // always known, never subject to the forget loop below. Identity is handled the same way
+    // the hub's is too: Renderer/GameCanvas special-case `kind === "satellite"` as always
+    // identified, rather than this loop also stuffing it into identifiedContacts redundantly.
+    for (const sat of this.satellites) {
+      const satContact = this.satelliteContact(sat);
+      this.discoveredContacts.set(satContact.id, { contact: satContact, age: 0 });
+    }
 
     if (this.pingActive) {
-      this.pingRadius += PING_SPEED * dt;
+      this.pingRadius += ship.pingSpeed * dt;
       let newlyDetected = 0;
       for (const contact of contacts) {
         const surfaceDist = distance(ship.pos, contact.pos) - contact.radius;
@@ -444,19 +522,48 @@ export class Engine {
           "#7fe0ff",
         );
       }
-      if (this.pingRadius > PING_MAX_RADIUS) this.pingActive = false;
+      if (this.pingRadius > ship.pingMaxRadius) this.pingActive = false;
     }
-    // Passive close-range detection — a proximity sensor, not eyes: refreshes position
-    // knowledge for anything nearby regardless of whether it's actually in view right now.
-    for (const contact of contacts) {
-      if (distance(ship.pos, contact.pos) - contact.radius < VISION_RADIUS) {
-        this.discoveredContacts.set(contact.id, { contact, age: 0 });
+    // Passive Ping (map-radar-spec.md Section 5) — an automatic, weaker sweep on its own timer,
+    // independent of the manual ping above. ship.passivePingInterval is 0 until Passive Ping
+    // Array is bought, so this is a no-op for most of the game. Unlike manual ping, this is an
+    // instant reveal (no expanding-wave visual) rather than a second animated ring to render.
+    // Gated by ship.powered and costs battery on each pulse, same as manual ping — it's still an
+    // active sensor sweep, "automatic" doesn't mean "free," and it shouldn't keep working at full
+    // strength while every other active system has gone dark. The timer keeps accumulating even
+    // while unpowered (deliberately not paused/reset) — the sensor was ready, just starved; once
+    // power returns it fires on whatever's left of its cycle rather than restarting from zero.
+    if (ship.passivePingInterval > 0) {
+      this.passivePingTimer += dt;
+      if (this.passivePingTimer >= ship.passivePingInterval && ship.powered) {
+        this.passivePingTimer = 0;
+        ship.applyPowerDelta(-PASSIVE_PING_POWER_COST * ship.powerDrawMult);
+        for (const contact of contacts) {
+          const surfaceDist = distance(ship.pos, contact.pos) - contact.radius;
+          if (surfaceDist <= PASSIVE_PING_RADIUS) {
+            this.discoveredContacts.set(contact.id, { contact, age: 0 });
+          }
+        }
       }
     }
-    // Identification is different — it means having actually seen the thing, so unlike passive
-    // detection above it requires it to genuinely be on screen right now, not just within an
-    // abstract sensor radius (VISION_RADIUS can exceed half the viewport, which was letting
-    // things get "identified" while still well off camera).
+    // Passive close-range detection — generalized over every sensor source (ship vision, hub
+    // beacon, every deployed satellite) rather than one hand-written loop per kind (map-radar-spec.md
+    // Section 5) — a future sensor kind is one more entry in sensorSources(), not a new loop here.
+    // Also feeds fog-of-war: anywhere any of these has swept is permanently "explored" for the
+    // hub's Map tab, regardless of whether anything was actually there to detect.
+    const sensors = this.sensorSources();
+    for (const source of sensors) {
+      for (const contact of contacts) {
+        if (distance(source.pos, contact.pos) - contact.radius < source.radius) {
+          this.discoveredContacts.set(contact.id, { contact, age: 0 });
+        }
+      }
+    }
+    this.markExplored(sensors);
+    // Identification is different — it means having actually seen the thing with your own eyes,
+    // so unlike passive detection above it requires it to genuinely be on the ship's screen right
+    // now, not just within an abstract sensor radius (any sensor's radius can exceed half the
+    // viewport, and a beacon/satellite sighting isn't the ship actually looking at it).
     const camOffset = sub(ship.pos, v2(this.width / 2, this.height / 2));
     for (const contact of contacts) {
       const screenPos = sub(contact.pos, camOffset);
@@ -467,22 +574,30 @@ export class Engine {
         screenPos.y - contact.radius <= this.height;
       if (onScreen) this.identifiedContacts.add(contact.id);
     }
-    // Forgotten for any of three reasons: it's simply gone stale (nothing's refreshed it in a
-    // while), the ship is too far from where it was last seen (a ping is a local snapshot, not
-    // a permanent mark), or — unlike either of those, which are about *our* knowledge going
-    // stale — the thing itself no longer exists at all (mined out, destroyed). `getContacts()`
-    // always lists every rock body currently alive anywhere in the world, not just nearby ones,
-    // so "not in this frame's contacts" reliably means gone, not just out of range; without this
-    // a fully-mined asteroid's radar blip would otherwise linger for up to CONTACT_FORGET_AFTER
-    // seconds after the last cell was extracted, same as any other memory going stale. The hub
-    // is the sole exception to all three, refreshed unconditionally above.
+    // Forgotten for either of two reasons: the thing itself no longer exists at all (mined out,
+    // destroyed — getContacts() always lists every rock body currently alive anywhere in the
+    // world, not just nearby ones, so "not in this frame's contacts" reliably means gone), or the
+    // memory of it has simply outlived the hub map's own much longer staleness window
+    // (MAP_CONTACT_FORGET_AFTER — see constants.ts). There's deliberately no ship-distance cutoff
+    // here anymore: that's now a tactical-radar-only display concern (Renderer.renderRadarIndicator,
+    // CONTACT_MAX_RANGE), not a memory one — the hub Map tab is exactly the place a contact seen
+    // far away and long since left behind is still meant to be useful, dimmed as stale. The hub
+    // and every satellite are exempt from this entirely, same as before.
     const liveContactIds = new Set(contacts.map((c) => c.id));
     for (const [id, memory] of this.discoveredContacts) {
-      if (id === hubContact.id) continue;
+      if (id === hubContact.id || id.startsWith("satellite-")) continue;
       const gone = !liveContactIds.has(id);
-      const tooFar = distance(ship.pos, memory.contact.pos) > CONTACT_MAX_RANGE;
-      if (gone || memory.age > CONTACT_FORGET_AFTER || tooFar) this.discoveredContacts.delete(id);
+      if (gone || memory.age > MAP_CONTACT_FORGET_AFTER) this.discoveredContacts.delete(id);
     }
+
+    // --- power: battery regen (baseline + solar, boosted near the hub once Reactor is built)
+    // and the passive vision draw — every other draw (ping above; scan, tools below) happens at
+    // its own call site instead of being centralized here, same reasoning tool signature cost
+    // already uses (the cost lives with what causes it, not a hand-matched central list).
+    const solarRegen = this.totalSolarExposure(ship.pos) * BATTERY_SOLAR_REGEN_MULT * ship.solarRegenMult;
+    const reactorBoost = this.nearHub && this.hub.reactorBuilt ? REACTOR_DOCK_SOLAR_BOOST : 0;
+    ship.applyPowerDelta((BATTERY_BASELINE_REGEN_PER_SEC + solarRegen + reactorBoost) * dt);
+    ship.applyPowerDelta(-VISION_POWER_DRAW_PER_SEC * ship.powerDrawMult * dt);
 
     // --- scan: hold E in range while a wave sweeps outward from the nearest asteroid ---
     // With a whole belt instead of one rock, "the asteroid" becomes "whichever one you're
@@ -492,11 +607,13 @@ export class Engine {
     if (scanTarget && !scanTarget.scanned) {
       const surfaceDist = distance(ship.pos, scanTarget.center) - scanTarget.outerRadius;
       const canScan = surfaceDist <= SCAN_RANGE;
-      if (canScan && input.isDown("e")) {
-        const scanSeconds = scanSecondsForRadius(scanTarget.outerRadius);
+      if (canScan && input.isDown("e") && ship.powered) {
+        const scanSeconds = scanSecondsForRadius(scanTarget.outerRadius) * ship.scanSpeedMult;
         scanTarget.scanProgress = Math.min(1, scanTarget.scanProgress + dt / scanSeconds);
+        ship.applyPowerDelta(-SCAN_POWER_DRAW_PER_SEC * ship.powerDrawMult * dt);
         if (scanTarget.scanProgress >= 1) {
           scanTarget.scanned = true;
+          this.scannedTypes.add(scanTarget.type);
           this.setMessage("ASTEROID SCANNED — see SCAN DATA panel", "#7fe0ff");
         }
       } else {
@@ -509,10 +626,12 @@ export class Engine {
     if (input.wasJustPressed("2")) ship.selectedTool = "drill";
     if (input.wasJustPressed("3")) ship.selectedTool = "charges";
 
+    if (input.wasJustPressed("g")) this.deploySatellite();
+
     this.activeBeam = null;
     this.updateMining(dt, worldMouse);
 
-    ship.decaySignature(dt, SIGNATURE_DECAY_PER_SEC);
+    ship.decaySignature(dt, ship.signatureDecayPerSec);
 
     this.blastEffects = this.blastEffects.filter((b) => {
       b.timer -= dt;
@@ -587,11 +706,13 @@ export class Engine {
   private handleShipDestroyed(cause = "SHIP DESTROYED") {
     const lost = this.ship.cargoUsed;
     this.ship.clearCargo();
-    this.ship.hull = MAX_HULL;
+    this.ship.hull = this.ship.maxHull;
     this.ship.temperature = 0;
+    this.ship.fuel = this.ship.fuelCapacity;
+    this.ship.battery = this.ship.batteryCapacity;
     this.ship.pos = { ...SPAWN_POS };
     this.ship.vel = v2(0, 0);
-    this.ship.chargesCarried = CHARGE_MAX_CARRIED;
+    this.ship.chargesCarried = this.ship.chargeMaxCarried;
     this.ship.anchored = false;
     this.anchoredCell = null;
     this.chunks = [];
@@ -600,6 +721,14 @@ export class Engine {
     // over blips from wherever the ship just died. The hub itself needs no special-casing here:
     // it's refreshed unconditionally every frame regardless of this map's contents (see update()).
     this.discoveredContacts.clear();
+    // Death can happen mid-frame, while a ping is still expanding (the ship movement substep
+    // loop that can trigger this runs before the sensor block later in the same frame) — an
+    // in-flight ping has to be cancelled here too, not just the memory above. Otherwise it keeps
+    // sweeping this same frame from the *new*, teleported position with whatever radius it had
+    // already grown to, which can easily "reach" something (the star, if that's what you just
+    // died to) that was never actually pinged from the hub — instantly undoing the clear above.
+    this.pingActive = false;
+    this.pingRadius = 0;
     this.deathScreen = { cause, cargoLost: lost, timer: DEATH_SCREEN_DURATION };
   }
 
@@ -608,11 +737,13 @@ export class Engine {
    *  path. Still not real orbital mechanics for the whole belt (no per-body orbit is computed
    *  or maintained) — bodies simply feel the same local pull everything else does, and mostly
    *  never get close enough to a well to notice, since the belt's inner edge sits outside the
-   *  home star's pull radius entirely. */
-  private applyGravityTo(mover: { pos: Vec2; vel: Vec2 }, dt: number) {
+   *  home star's pull radius entirely. `resistMult` defaults to 1 (full pull) for everything —
+   *  only the ship ever passes something else, via Inertial Dampeners (upgrades.ts); rock/chunks
+   *  always feel the real thing regardless of what the ship has bought. */
+  private applyGravityTo(mover: { pos: Vec2; vel: Vec2 }, dt: number, resistMult = 1) {
     for (const source of this.gravitySources) {
       const accel = gravityAccel(source, mover.pos);
-      mover.vel = add(mover.vel, scale(accel, dt));
+      mover.vel = add(mover.vel, scale(accel, dt * resistMult));
     }
   }
 
@@ -646,11 +777,96 @@ export class Engine {
     return total;
   }
 
+  /** Summed solar exposure from every gravity source at `pos` — same shape as
+   *  totalRadiantHeatExposure above, but feeds Ship.battery regen (see update()'s power block),
+   *  not hull/temperature. Deliberately a separate total: a source can radiate one without the
+   *  other (see gravity.ts's GravitySource doc comment). */
+  private totalSolarExposure(pos: Vec2): number {
+    let total = 0;
+    for (const source of this.gravitySources) total += solarExposure(source, pos);
+    return total;
+  }
+
   /** The hub as a radar Contact — used to keep it permanently "known" (see the discovery
    *  refresh in update()), not run through the normal ping/vision discovery gates everything
    *  else on radar goes through. You always know where home is. */
   private hubContact(): Contact {
-    return { id: "hub", kind: "hub", pos: this.hub.pos, radius: HUB_RADIUS, label: "Home Hub" };
+    // hub.radius, not the flat HUB_RADIUS constant — a more built-up hub (hub-growth-spec.md) is
+    // genuinely bigger and easier to spot, the same "grown footprint" the renderer draws.
+    return { id: "hub", kind: "hub", pos: this.hub.pos, radius: this.hub.radius, label: "Home Hub" };
+  }
+
+  /** A deployed satellite as a radar Contact — same "always known" treatment as the hub (see
+   *  update()), not something you have to find. */
+  private satelliteContact(sat: Satellite): Contact {
+    return { id: sat.id, kind: "satellite", pos: sat.pos, radius: 20, label: "Satellite" };
+  }
+
+  /** Every currently-active passive sensor — ship vision, hub beacon (if built), every deployed
+   *  satellite — as one generic list (map-radar-spec.md Section 5), so both passive contact
+   *  discovery and fog-of-war exploration (markExplored below) read the same source of truth
+   *  instead of each hand-listing "ship, hub, satellites" separately. A future sensor kind is one
+   *  more entry pushed here, not a new loop at either call site. Ship vision drops to
+   *  POWERLESS_VISION_RADIUS while the battery is empty — blind, not eyes-closed; the hub beacon
+   *  and any satellite are unaffected by the *ship's* power state, they run on their own. */
+  private sensorSources(): { pos: Vec2; radius: number }[] {
+    const sources = [{ pos: this.ship.pos, radius: this.ship.powered ? this.ship.visionRadius : POWERLESS_VISION_RADIUS }];
+    if (this.hub.beaconRange > 0) sources.push({ pos: this.hub.pos, radius: this.hub.beaconRange });
+    for (const sat of this.satellites) sources.push({ pos: sat.pos, radius: SATELLITE_VISION_RADIUS });
+    return sources;
+  }
+
+  /** Marks every fog-of-war sector any sensor source currently reaches as permanently explored
+   *  (map-radar-spec.md Section 3) — coarse grid, not per-pixel, and cheap: every sensor radius
+   *  today is small relative to MAP_SECTOR_SIZE, so this touches only a handful of sectors per
+   *  source per frame. Only read by the hub's Map tab — the field itself never renders fog, the
+   *  map is a hub-only screen (deliberately, so it reads as a chart you consult between
+   *  expeditions rather than a HUD element). */
+  private markExplored(sensors: { pos: Vec2; radius: number }[]) {
+    for (const source of sensors) {
+      const minSx = Math.floor((source.pos.x - source.radius) / MAP_SECTOR_SIZE);
+      const maxSx = Math.floor((source.pos.x + source.radius) / MAP_SECTOR_SIZE);
+      const minSy = Math.floor((source.pos.y - source.radius) / MAP_SECTOR_SIZE);
+      const maxSy = Math.floor((source.pos.y + source.radius) / MAP_SECTOR_SIZE);
+      for (let sx = minSx; sx <= maxSx; sx++) {
+        for (let sy = minSy; sy <= maxSy; sy++) {
+          const cx = (sx + 0.5) * MAP_SECTOR_SIZE;
+          const cy = (sy + 0.5) * MAP_SECTOR_SIZE;
+          // Generous margin (a full sector) so a source near a sector's edge doesn't leave an
+          // obviously-in-range neighbor unmarked just because its *center* is a bit further off.
+          if (distance(v2(cx, cy), source.pos) <= source.radius + MAP_SECTOR_SIZE * 0.7) {
+            this.exploredSectors.add(`${sx},${sy}`);
+          }
+        }
+      }
+    }
+  }
+
+  /** Bound to a field-only key (G) in update(), not called from anywhere outside this class —
+   *  unlike purchaseUpgrade/startResearch (which the hub's DOM overlay calls directly), so this
+   *  stays private. Deploys a satellite at the ship's current position — a real, costed decision
+   *  (materials spent from the ship's own cargo, not hub storage, since this happens out in the
+   *  field) capped by Hub.satelliteCap so "carpet the belt in them" isn't the answer
+   *  (map-radar-spec.md Section 6/7). */
+  private deploySatellite(): boolean {
+    if (this.scene !== "field") return false;
+    const { ship, hub } = this;
+    if (!hub.observatoryBuilt) {
+      this.setMessage("OBSERVATORY REQUIRED", "#ff8f6b");
+      return false;
+    }
+    if (this.satellites.length >= hub.satelliteCap) {
+      this.setMessage("SATELLITE CAP REACHED", "#ff8f6b");
+      return false;
+    }
+    if (!canAfford(ship.cargo, SATELLITE_DEPLOY_COST_FULL)) {
+      this.setMessage("NOT ENOUGH MATERIALS", "#ff8f6b");
+      return false;
+    }
+    for (const key of COMPOSITIONS) ship.cargo[key] -= SATELLITE_DEPLOY_COST_FULL[key];
+    this.satellites.push({ id: `satellite-${nextSatelliteId++}`, pos: { ...ship.pos } });
+    this.setMessage("SATELLITE DEPLOYED", "#7de08d");
+    return true;
   }
 
   /** A gravity source (the star today) as a radar Contact — goes through the normal ping/vision
@@ -673,11 +889,18 @@ export class Engine {
    *  range), not automatic, so drifting near the hub mid-expedition doesn't interrupt anything. */
   private updateDocking() {
     const { ship, hub, input } = this;
-    this.nearHub = distance(ship.pos, hub.pos) <= HUB_DOCK_RANGE;
+    this.nearHub = distance(ship.pos, hub.pos) <= hub.dockRange;
     if (this.nearHub && input.wasJustPressed("f")) {
       const deposited = ship.clearCargo();
       hub.deposit(deposited);
       this.scene = "hub";
+      // Repair Bay (upgrades.ts) — before this existed, hull only ever reset on death.
+      if (hub.repairOnDock) ship.hull = ship.maxHull;
+      // Fuel/battery refill unconditionally on dock — unlike hull repair (an upgrade-gated
+      // convenience), refueling is baseline: fuel-power-spec.md Section 2 treats "refills only
+      // at dock" as fuel's basic rule, not something you have to earn.
+      ship.fuel = ship.fuelCapacity;
+      ship.battery = ship.batteryCapacity;
       this.setMessage("DOCKED", "#7de08d");
     }
   }
@@ -701,26 +924,232 @@ export class Engine {
     this.setMessage("LAUNCHED", "#7fe0ff");
   }
 
-  /** Public: called from the hub's DOM overlay. Spends materials exactly (no currency,
-   *  no partial refunds) and applies the upgrade's effect directly — see upgrades.ts for why
-   *  that's still hand-written rather than generic with only one upgrade to generalize from. */
+  /** Public: called from the hub's DOM overlay. Spends materials exactly (no currency, no
+   *  partial refunds) — debited generically over every resource key (COMPOSITIONS), then hands
+   *  off to applyUpgradeEffects for the actual stat/flag dispatch, shared with debugMaxHub below
+   *  so the two paths can never drift apart. A `requiresResearch` upgrade can't be bought until
+   *  the gating project is in `hub.completedResearch`. */
   purchaseUpgrade(id: UpgradeId): boolean {
     if (this.scene !== "hub") return false;
-    const { hub, ship } = this;
+    const { hub } = this;
     if (hub.purchasedUpgrades.has(id)) return false;
 
     const def = UPGRADES[id];
+    if (def.requiresResearch && !hub.completedResearch.has(def.requiresResearch)) {
+      this.setMessage("RESEARCH REQUIRED", "#ff8f6b");
+      return false;
+    }
     if (!canAfford(hub.materials, def.cost)) {
       this.setMessage("NOT ENOUGH MATERIALS", "#ff8f6b");
       return false;
     }
 
-    hub.materials.ore -= def.cost.ore;
-    hub.materials.crystal -= def.cost.crystal;
-    hub.materials.unstable -= def.cost.unstable;
-    hub.purchasedUpgrades.add(id);
-    ship.cargoCapacity += def.cargoCapacityBonus;
+    for (const key of COMPOSITIONS) hub.materials[key] -= def.cost[key];
+    this.applyUpgradeEffects(id);
     this.setMessage(`PURCHASED — ${def.label}`, "#7de08d");
+    return true;
+  }
+
+  /** The actual effect dispatch (upgrades-spec.md Section 5) — one pass over
+   *  `shipStats`/`hubStats`/`hubFlags` regardless of what's calling it. Deliberately separate
+   *  from cost/gate checks so `debugMaxHub` can reuse it directly instead of faking a purchase. */
+  private applyUpgradeEffects(id: UpgradeId) {
+    const { hub, ship } = this;
+    const def = UPGRADES[id];
+    hub.purchasedUpgrades.add(id);
+    if (def.shipStats) {
+      for (const [stat, bonus] of Object.entries(def.shipStats) as [ShipStatKey, number][]) {
+        this.applyShipStatBonus(ship, stat, bonus);
+      }
+    }
+    if (def.hubStats) {
+      for (const [stat, bonus] of Object.entries(def.hubStats) as [HubStatKey, number][]) {
+        this.applyHubStatBonus(hub, stat, bonus);
+      }
+    }
+    if (def.hubFlags) {
+      for (const flag of def.hubFlags) hub[flag] = true;
+    }
+  }
+
+  /** DEV-ONLY: instantly owns every Hub-tier upgrade (Standard + Facility), bypassing cost and
+   *  research gates entirely — bound to a debug key (0) in update(), not reachable from the DOM
+   *  overlay. A fast way to see the hub's full visual growth (hub-growth-spec.md) without
+   *  grinding materials/research for every facility one at a time. Ship-tier upgrades are
+   *  untouched — this is specifically for previewing the hub, not a general cheat. */
+  private debugMaxHub() {
+    for (const def of Object.values(UPGRADES)) {
+      if (def.category === "ship" || this.hub.purchasedUpgrades.has(def.id)) continue;
+      this.applyUpgradeEffects(def.id);
+    }
+    this.setMessage("DEBUG: HUB MAXED", "#c8a0ff");
+  }
+
+  /** One explicit case per stat rather than dynamic `ship[stat] += bonus` — keeps this type-safe
+   *  and matches the small-dispatch pattern already used elsewhere (e.g. reactToCollision)
+   *  instead of leaning on an index signature that would happily accept a typo'd key. */
+  private applyShipStatBonus(ship: Ship, stat: ShipStatKey, bonus: number) {
+    switch (stat) {
+      case "thrustForce":
+        ship.thrustForce += bonus;
+        break;
+      case "rcsDrag":
+        ship.rcsDrag += bonus;
+        break;
+      case "visionRadius":
+        ship.visionRadius += bonus;
+        break;
+      case "pingMaxRadius":
+        ship.pingMaxRadius += bonus;
+        break;
+      case "pingSpeed":
+        ship.pingSpeed += bonus;
+        break;
+      case "temperatureDamageThreshold":
+        ship.temperatureDamageThreshold += bonus;
+        break;
+      case "temperatureDecayPerSec":
+        ship.temperatureDecayPerSec += bonus;
+        break;
+      case "signatureDecayPerSec":
+        ship.signatureDecayPerSec += bonus;
+        break;
+      case "maxHull":
+        ship.maxHull += bonus;
+        ship.hull += bonus; // a hull upgrade should feel like a heal too, not just a higher cap
+        break;
+      case "chargeMaxCarried":
+        ship.chargeMaxCarried += bonus;
+        ship.chargesCarried += bonus;
+        break;
+      case "cargoCapacity":
+        ship.cargoCapacity += bonus;
+        break;
+      case "laserRangeBonus":
+        ship.laserRangeBonus += bonus;
+        break;
+      case "drillAnchorRangeBonus":
+        ship.drillAnchorRangeBonus += bonus;
+        break;
+      case "scanSpeedMult":
+        ship.scanSpeedMult += bonus;
+        break;
+      case "signatureGainMult":
+        ship.signatureGainMult += bonus;
+        break;
+      case "gravityResistMult":
+        ship.gravityResistMult += bonus;
+        break;
+      case "cargoMassFactor":
+        ship.cargoMassFactor = Math.max(0, ship.cargoMassFactor + bonus);
+        break;
+      case "fuelCapacity":
+        ship.fuelCapacity += bonus;
+        ship.fuel += bonus; // a fuel upgrade should feel like a top-up too, not just a higher cap
+        break;
+      case "batteryCapacity":
+        ship.batteryCapacity += bonus;
+        ship.battery += bonus;
+        break;
+      case "solarRegenMult":
+        ship.solarRegenMult += bonus;
+        break;
+      case "powerDrawMult":
+        ship.powerDrawMult = Math.max(0.1, ship.powerDrawMult + bonus);
+        break;
+      case "passivePingInterval":
+        ship.passivePingInterval += bonus;
+        break;
+    }
+  }
+
+  private applyHubStatBonus(hub: Hub, stat: HubStatKey, bonus: number) {
+    switch (stat) {
+      case "beaconRange":
+        hub.beaconRange += bonus;
+        break;
+      case "structuralIntegrity":
+        hub.structuralIntegrity += bonus;
+        break;
+      case "researchSpeedMult":
+        hub.researchSpeedMult = Math.max(0.1, hub.researchSpeedMult + bonus);
+        break;
+      case "satelliteCap":
+        hub.satelliteCap += bonus;
+        break;
+    }
+  }
+
+  /** Public: called from the hub's DOM overlay. Starts the one active research project (Hub
+   *  Facility research capacity is a single slot until a future Research Lab tier adds a
+   *  second — see upgrades-spec.md Section 3b) — checks every gate a project can have
+   *  (research.ts's four shapes), debits materials the same way a purchase does, and begins
+   *  ticking down in `updateResearch`. */
+  startResearch(id: ResearchId): boolean {
+    if (this.scene !== "hub") return false;
+    const { hub } = this;
+    if (hub.activeResearch) {
+      this.setMessage("RESEARCH ALREADY IN PROGRESS", "#ff8f6b");
+      return false;
+    }
+    if (hub.completedResearch.has(id)) return false;
+
+    const def = RESEARCH[id];
+    if (def.requiresSample && !hub.everDeposited.has(def.requiresSample)) {
+      this.setMessage("SAMPLE REQUIRED", "#ff8f6b");
+      return false;
+    }
+    if (def.requiresScannedType && !this.scannedTypes.has(def.requiresScannedType)) {
+      this.setMessage("UNSCANNED BODY TYPE", "#ff8f6b");
+      return false;
+    }
+    if (def.requiresFacility && !hub.purchasedUpgrades.has(def.requiresFacility)) {
+      this.setMessage("FACILITY REQUIRED", "#ff8f6b");
+      return false;
+    }
+    if (!canAfford(hub.materials, def.cost)) {
+      this.setMessage("NOT ENOUGH MATERIALS", "#ff8f6b");
+      return false;
+    }
+
+    for (const key of COMPOSITIONS) hub.materials[key] -= def.cost[key];
+    hub.activeResearch = { id, remainingSeconds: def.researchSeconds };
+    this.setMessage(`RESEARCH STARTED — ${def.label}`, "#7fe0ff");
+    return true;
+  }
+
+  private updateResearch(dt: number) {
+    const { hub } = this;
+    if (!hub.activeResearch) return;
+    hub.activeResearch.remainingSeconds -= dt * hub.researchSpeedMult;
+    if (hub.activeResearch.remainingSeconds > 0) return;
+
+    const def = RESEARCH[hub.activeResearch.id];
+    hub.completedResearch.add(def.id);
+    hub.activeResearch = null;
+    if (def.researchSpeedMultBonus) {
+      hub.researchSpeedMult = Math.max(0.1, hub.researchSpeedMult + def.researchSpeedMultBonus);
+    }
+    this.setMessage(`RESEARCH COMPLETE — ${def.label}`, "#7de08d");
+  }
+
+  /** Public: called from the hub's DOM overlay, only available once Refinery is built. A small
+   *  fixed recipe table (not an arbitrary N-by-N converter) — grinds a batch of bulk material
+   *  into a smaller amount of something worth having, at a real loss, so Chondrite Rock (the
+   *  most common, least valuable resource — twin-star-spec.md Section 17) has somewhere to go
+   *  once you've got more than any upgrade actually wants. */
+  refineMaterial(recipeId: RefineRecipeId): boolean {
+    if (this.scene !== "hub" || !this.hub.refineryBuilt) return false;
+    const { hub } = this;
+    const recipe = REFINE_RECIPES[recipeId];
+    if (hub.materials[recipe.from] < recipe.inputAmount) {
+      this.setMessage("NOT ENOUGH MATERIAL", "#ff8f6b");
+      return false;
+    }
+    hub.materials[recipe.from] -= recipe.inputAmount;
+    hub.materials[recipe.to] += recipe.outputAmount;
+    hub.everDeposited.add(recipe.to);
+    this.setMessage(`REFINED ${recipe.inputAmount} ${recipe.from} → ${recipe.outputAmount} ${recipe.to}`, "#7de08d");
     return true;
   }
 
@@ -848,8 +1277,10 @@ export class Engine {
 
   private shipBody(): BodyHandle {
     const { ship } = this;
+    // ship.mass, not the flat SHIP_MASS constant — a loaded cargo hold is real collision mass
+    // now (see Ship.mass), same physics-through-line as the density-aware rock/chunk mass.
     return {
-      body: { kind: "ship", pos: ship.pos, vel: ship.vel, radius: SHIP_RADIUS, mass: SHIP_MASS, material: SHIP_MATERIAL },
+      body: { kind: "ship", pos: ship.pos, vel: ship.vel, radius: SHIP_RADIUS, mass: ship.mass, material: SHIP_MATERIAL },
       write: (pos, vel) => {
         ship.pos = pos;
         ship.vel = vel;
@@ -1072,9 +1503,13 @@ export class Engine {
     }
   }
 
+  /** Every cell in a group can be a different resource (a Voronoi tessellation isn't
+   *  single-material) — massForArea (asteroid.ts) is keyed per-cell by its own composition, the
+   *  same density-aware formula a loose Chunk uses, so a group's mass reflects what it's
+   *  actually made of rather than treating every cell as equally dense rock. */
   private groupMass(group: DriftGroup): number {
-    const area = group.cells.reduce((sum, c) => sum + polygonArea(c.polygon), 0);
-    return Math.max(1, area * ROCK_MASS_PER_AREA);
+    const mass = group.cells.reduce((sum, c) => sum + massForArea(c.composition, polygonArea(c.polygon)), 0);
+    return Math.max(1, mass);
   }
 
   /** Mass-weighted center of mass — the pivot every group rotates and is pushed around.
@@ -1084,7 +1519,7 @@ export class Engine {
     let totalMass = 0;
     let acc = v2(0, 0);
     for (const cell of cells) {
-      const m = polygonArea(cell.polygon) * ROCK_MASS_PER_AREA;
+      const m = massForArea(cell.composition, polygonArea(cell.polygon));
       acc = add(acc, scale(cell.centroid, m));
       totalMass += m;
     }
@@ -1100,8 +1535,9 @@ export class Engine {
   private groupInertia(group: DriftGroup, com: Vec2): number {
     let inertia = 0;
     for (const cell of group.cells) {
-      const m = polygonArea(cell.polygon) * ROCK_MASS_PER_AREA;
-      const ownInertia = polygonSecondMomentOfArea(cell.polygon) * ROCK_MASS_PER_AREA;
+      const massPerArea = massPerAreaFor(cell.composition);
+      const m = polygonArea(cell.polygon) * massPerArea;
+      const ownInertia = polygonSecondMomentOfArea(cell.polygon) * massPerArea;
       const d = distance(cell.centroid, com);
       inertia += ownInertia + m * d * d;
     }
@@ -1176,7 +1612,7 @@ export class Engine {
         if (cell.fractured) continue;
         intact.push(cell);
         cellOrigin.set(cell.id, asteroid);
-        const m = polygonArea(cell.polygon);
+        const m = massForArea(cell.composition, polygonArea(cell.polygon));
         sumX += cell.centroid.x * m;
         sumY += cell.centroid.y * m;
         totalMass += m;
@@ -1345,25 +1781,29 @@ export class Engine {
     this.anchoredCell = null;
 
     const toolDef = TOOLS[ship.selectedTool];
-    const inRange = distance(ship.pos, worldMouse) <= toolDef.range;
+    // Laser Focusing Lens (upgrades.ts) only applies while the laser is actually selected — the
+    // bonus lives on the ship, but it shouldn't quietly extend charges' range too.
+    const rangeBonus = ship.selectedTool === "laser" ? ship.laserRangeBonus : 0;
+    const inRange = distance(ship.pos, worldMouse) <= toolDef.range + rangeBonus;
     const cell = inRange ? this.cellAt(worldMouse) : null;
     const validCell = cell && !cell.fractured ? cell : null;
     if (validCell) this.currentTarget = validCell;
 
     if (ship.selectedTool === "laser") {
-      if (input.mouseDown && validCell) this.cutCell(validCell, dt);
+      if (input.mouseDown && validCell && ship.powered) this.cutCell(validCell, dt);
     } else {
       if (
         input.mouseJustPressed &&
         validCell &&
         !validCell.hasCharge &&
-        ship.chargesCarried > 0
+        ship.chargesCarried > 0 &&
+        ship.powered
       ) {
         validCell.hasCharge = true;
         ship.chargesCarried -= 1;
         this.setMessage("CHARGE PLACED", "#ffcf5c");
       }
-      if (input.wasJustPressed("r")) this.detonateCharges();
+      if (input.wasJustPressed("r") && ship.powered) this.detonateCharges();
     }
   }
 
@@ -1385,7 +1825,8 @@ export class Engine {
     const info = COMPOSITION_INFO[cell.composition];
     const mult = info.recommendedTool === "laser" ? TOOL_RECOMMENDED_MULT : TOOL_OFF_MULT;
     cell.cutProgress += dt * mult;
-    ship.addSignature((TOOLS.laser.sigPerSecond ?? 0) * dt);
+    ship.addSignature((TOOLS.laser.sigPerSecond ?? 0) * dt * ship.signatureGainMult);
+    ship.applyPowerDelta(-(TOOLS.laser.powerPerSecond ?? 0) * ship.powerDrawMult * dt);
 
     const nearest = closestBoundaryPoint(cell.polygon, ship.pos);
     if (nearest) this.activeBeam = { from: ship.pos, to: nearest.point, tool: "laser" };
@@ -1406,7 +1847,7 @@ export class Engine {
       this.spawnChunk(
         polygonCentroid(result.sliver),
         cell.composition,
-        info.chunkValue,
+        chunkValueForArea(info.chunkValue, polygonArea(result.sliver)),
         scale(outDir, 55 + Math.random() * 30),
       );
     }
@@ -1422,7 +1863,7 @@ export class Engine {
    *  where the cursor happens to be. */
   private nearestDrillableCell(): { cell: Cell; boundary: BoundaryHit } | null {
     let best: { cell: Cell; boundary: BoundaryHit } | null = null;
-    let bestDist = DRILL_ANCHOR_RANGE;
+    let bestDist = DRILL_ANCHOR_RANGE + this.ship.drillAnchorRangeBonus;
     for (const asteroid of this.asteroids) {
       for (const cell of asteroid.cells) {
         if (cell.fractured) continue;
@@ -1454,7 +1895,7 @@ export class Engine {
       this.anchoredCell = null;
     }
 
-    const canAnchor = !!nearby && input.mouseDown;
+    const canAnchor = !!nearby && input.mouseDown && this.ship.powered;
 
     if (canAnchor && nearby) {
       const { cell: validTarget, boundary } = nearby;
@@ -1482,7 +1923,8 @@ export class Engine {
       const info = COMPOSITION_INFO[validTarget.composition];
       const mult = info.recommendedTool === "drill" ? TOOL_RECOMMENDED_MULT : TOOL_OFF_MULT;
       validTarget.boreProgress += (dt * mult) / info.boreSeconds;
-      ship.addSignature((TOOLS.drill.sigPerSecond ?? 0) * dt);
+      ship.addSignature((TOOLS.drill.sigPerSecond ?? 0) * dt * ship.signatureGainMult);
+      ship.applyPowerDelta(-(TOOLS.drill.powerPerSecond ?? 0) * ship.powerDrawMult * dt);
       this.activeBeam = { from: ship.pos, to: boundary.point, tool: "drill" };
 
       if (validTarget.boreProgress >= 1) {
@@ -1608,7 +2050,8 @@ export class Engine {
       if (hit) shipHit = true;
     }
 
-    ship.addSignature((TOOLS.charges.sigPerUse ?? 0) * charged.length);
+    ship.addSignature((TOOLS.charges.sigPerUse ?? 0) * charged.length * ship.signatureGainMult);
+    ship.applyPowerDelta(-(TOOLS.charges.powerPerUse ?? 0) * charged.length * ship.powerDrawMult);
     this.setMessage(
       shipHit
         ? `DETONATED ${charged.length} CHARGE${charged.length > 1 ? "S" : ""} — CAUGHT IN THE BLAST`
@@ -1677,7 +2120,7 @@ export class Engine {
   /** Ejects a cell's entire remaining mass as a single chunk (drill completion / charge detonation / laser's final piece). */
   private extractWholeCell(cell: Cell, impulseSpeed: number) {
     const info = COMPOSITION_INFO[cell.composition];
-    const value = info.chunkValue * Math.max(1, cell.piecesRemaining);
+    const value = chunkValueForArea(info.chunkValue, polygonArea(cell.polygon));
     const pos = cell.centroid;
     const outDir = this.outwardDirection(cell);
     cell.fractured = true;

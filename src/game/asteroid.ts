@@ -4,13 +4,22 @@ import {
   ASTEROID_BASE_RADIUS,
   ASTEROID_OUTLINE_POINTS,
   ASTEROID_SEED_COUNT,
+  MATERIAL_WEIGHT_SCALE,
+  REFERENCE_CELL_AREA,
+  ROCK_MASS_PER_AREA,
   SCAN_HOLD_SECONDS,
   SCAN_SECONDS_MAX,
   SCAN_SECONDS_MIN,
 } from "./constants";
+import { weightedPick } from "./random";
 import { ToolId } from "./tools";
 
-export type Composition = "ore" | "crystal" | "unstable";
+/**
+ * Real, grounded resource names rather than an abstract "ore/crystal/unstable" placeholder set —
+ * see twin-star-spec.md Section 17. Each is tied to which AsteroidType can actually contain it
+ * (RESOURCE_WEIGHTS_BY_TYPE below), not just a flat universal chance.
+ */
+export type Composition = "rock" | "nickelIron" | "crystal" | "platinum" | "ice" | "radioactive";
 
 export interface CompositionInfo {
   composition: Composition;
@@ -18,47 +27,111 @@ export interface CompositionInfo {
   color: string;
   hardness: number; // 1-5, shown to the player — denser/tougher material takes more work
   totalPieces: number; // laser: number of cuts to fully consume the cell
-  chunkValue: number; // cargo value per piece (drill/charges yield totalPieces * chunkValue in one chunk)
+  chunkValue: number; // rough size/amount per piece (drill/charges yield totalPieces * chunkValue in one chunk)
+  // g/cm^3, real approximate density (ordinary chondrite, iron meteorite, olivine, etc.) — the
+  // actual weight (see weightKgFor) a given amount of this resource contributes to the cargo
+  // hold's real, mass-limited capacity. Two resources can have the same `chunkValue` (roughly
+  // the same physical size) and still weigh very differently, same as in reality.
+  density: number;
   cutSeconds: number; // laser: beam-seconds required per cut
   boreSeconds: number; // drill: seconds anchored required to bore out the whole cell
   recommendedTool: ToolId; // internal — biases mining speed, deliberately not surfaced in the UI
 }
 
 export const COMPOSITION_INFO: Record<Composition, CompositionInfo> = {
-  ore: {
-    composition: "ore",
-    label: "Soft Ore",
-    color: "#b08a5c",
-    hardness: 2,
-    totalPieces: 3,
+  rock: {
+    // Ordinary chondrite — the bulk material of most meteorites ever recovered on Earth, and the
+    // bulk of most asteroids in this system. Cargo-space tradeoff, not a resource worth seeking.
+    composition: "rock",
+    label: "Chondrite Rock",
+    color: "#8a7d6b",
+    hardness: 1,
+    totalPieces: 2,
     chunkValue: 1,
-    cutSeconds: 0.5,
-    boreSeconds: 2.0,
+    density: 3.3, // real ordinary chondrite density
+    cutSeconds: 0.3,
+    boreSeconds: 1.2,
+    recommendedTool: "laser",
+  },
+  nickelIron: {
+    // Real structural asteroid metal — the literal material of iron meteorites. The
+    // bread-and-butter resource upgrade costs are priced against.
+    composition: "nickelIron",
+    label: "Nickel-Iron",
+    color: "#9aa3ad",
+    hardness: 3,
+    totalPieces: 4,
+    chunkValue: 2,
+    density: 7.9, // real iron-nickel meteorite density
+    cutSeconds: 0.6,
+    boreSeconds: 2.4,
     recommendedTool: "drill",
   },
   crystal: {
+    // Olivine/pyroxene crystal formations — real precedent is peridot (gem-grade olivine),
+    // genuinely recovered from pallasite meteorites.
     composition: "crystal",
-    label: "Dense Crystal",
+    label: "Silicate Crystal",
     color: "#7fa8ff",
     hardness: 5,
     totalPieces: 6,
-    chunkValue: 1,
+    chunkValue: 3,
+    density: 3.5, // real olivine density, ~3.3-4.4
     cutSeconds: 0.8,
     boreSeconds: 3.6,
     recommendedTool: "charges",
   },
-  unstable: {
-    composition: "unstable",
-    label: "Hollow-Unstable",
-    color: "#7de08d",
+  platinum: {
+    // The actual reason real asteroid-mining proposals target metallic asteroids: rare on Earth,
+    // valuable for electronics/catalysis. Only ever found in M-type bodies.
+    composition: "platinum",
+    label: "Platinum-Group Ore",
+    color: "#d9d4c3",
+    hardness: 4,
+    totalPieces: 5,
+    chunkValue: 5,
+    density: 7.5, // ore, not pure metal — real platinum itself is ~21.5, this is host rock + PGMs
+    cutSeconds: 0.9,
+    boreSeconds: 3.0,
+    recommendedTool: "drill",
+  },
+  ice: {
+    // Water ice — genuinely rare this close to a hot star (real precedent: Mercury keeps ice in
+    // permanently-shadowed polar craters despite being the closest planet to the Sun). Not
+    // spendable on anything yet — earmarked for the still-unbuilt fuel/life-support systems.
+    // Soft and fast once found — it's finding it that's hard, not clearing it.
+    composition: "ice",
+    label: "Water Ice",
+    color: "#bfe9ff",
     hardness: 1,
-    totalPieces: 2,
-    chunkValue: 1,
-    cutSeconds: 0.35,
-    boreSeconds: 1.4,
+    totalPieces: 3,
+    chunkValue: 2,
+    density: 0.92, // real water ice density — deliberately less dense than rock, same as reality
+    cutSeconds: 0.25,
+    boreSeconds: 1.0,
     recommendedTool: "laser",
   },
+  radioactive: {
+    // Uranium/thorium-bearing minerals — real and hazardous. Recommended tool is charges for a
+    // safety reason, not a hardness one: place the charge and retreat, rather than lingering
+    // next to it boring or lasering for an extended exposure.
+    composition: "radioactive",
+    label: "Radioactive Ore",
+    color: "#7de08d",
+    hardness: 2,
+    totalPieces: 3,
+    chunkValue: 4,
+    density: 6.5, // ore, not pure uraninite — real uraninite is ~10.9, this is host rock + it
+    cutSeconds: 0.5,
+    boreSeconds: 2.0,
+    recommendedTool: "charges",
+  },
 };
+
+/** Canonical ordering, derived from COMPOSITION_INFO itself rather than hand-duplicated —
+ *  used anywhere that needs "every resource" (HUD material lists, scan-data breakdowns) so
+ *  adding a seventh resource later doesn't require updating three separate hardcoded arrays. */
+export const COMPOSITIONS = Object.keys(COMPOSITION_INFO) as Composition[];
 
 export interface Cell {
   id: number;
@@ -119,28 +192,50 @@ export function cellWorldToLocal(cell: Cell, point: Vec2): LocalPoint {
   return { a: dot(rel, x), b: dot(rel, y) };
 }
 
-const DEFAULT_COMPOSITION_WEIGHTS: Record<Composition, number> = { ore: 0.45, crystal: 0.3, unstable: 0.25 };
+/**
+ * Real asteroid spectral classification, simplified to what's relevant here (twin-star-spec.md
+ * Section 17) — the load-bearing new concept: an asteroid's type is discoverable (scan reveals
+ * it, same as composition always has been) and determines which resources are even possible to
+ * find on that body, not just flavor text over the same universal chance every asteroid had
+ * before.
+ */
+export type AsteroidType = "S" | "C" | "M" | "Icy";
 
-/** Named composition profiles a belt can draw from so asteroids read as different "types," not
- *  copies of the same rock with random paint — see Engine's belt scattering, which picks one
- *  of these per asteroid. */
-export const ASTEROID_ARCHETYPES: Record<Composition, number>[] = [
-  { ore: 0.7, crystal: 0.2, unstable: 0.1 }, // ore-rich
-  { ore: 0.2, crystal: 0.7, unstable: 0.1 }, // crystal-rich
-  { ore: 0.25, crystal: 0.25, unstable: 0.5 }, // unstable-rich
-  DEFAULT_COMPOSITION_WEIGHTS, // balanced
-];
+export interface AsteroidTypeInfo {
+  type: AsteroidType;
+  label: string; // shown once scanned, e.g. "S-type (Silicaceous)"
+}
 
-/** Lets one asteroid skew ore-rich, another crystal-rich, etc. (see Engine's belt scattering) —
- *  weights don't need to sum to 1, they're normalized here. */
-function makeCompositionPicker(weights: Record<Composition, number> = DEFAULT_COMPOSITION_WEIGHTS) {
-  const total = weights.ore + weights.crystal + weights.unstable;
-  return (roll: number): Composition => {
-    const r = roll * total;
-    if (r < weights.ore) return "ore";
-    if (r < weights.ore + weights.crystal) return "crystal";
-    return "unstable";
-  };
+export const ASTEROID_TYPE_INFO: Record<AsteroidType, AsteroidTypeInfo> = {
+  S: { type: "S", label: "S-type (Silicaceous)" },
+  C: { type: "C", label: "C-type (Carbonaceous)" },
+  M: { type: "M", label: "M-type (Metallic)" },
+  Icy: { type: "Icy", label: "Icy" },
+};
+
+/** What each asteroid type can actually contain, and how much of it — see twin-star-spec.md
+ *  Section 17 for the real-world reasoning behind each. Every type carries a small Radioactive
+ *  Ore chance ("any type, always rare" per spec) rather than that being a separate mechanic.
+ *  Weights don't need to sum to 1, weightedPick normalizes them. */
+export const RESOURCE_WEIGHTS_BY_TYPE: Record<AsteroidType, Record<Composition, number>> = {
+  // Stony with real metal content — the dominant type this close to the star, mirrors our own
+  // solar system's inner belt.
+  S: { rock: 0.55, nickelIron: 0.32, crystal: 0.1, platinum: 0, ice: 0, radioactive: 0.03 },
+  // Darker, more chemically primitive, mostly bulk rock with less metal than S-type.
+  C: { rock: 0.75, nickelIron: 0.1, crystal: 0.1, platinum: 0, ice: 0, radioactive: 0.05 },
+  // Dense, mostly metal — no filler rock, no crystal, no ice: finding one is a distinct, worth-
+  // seeking-out event, and Platinum-Group Ore only ever comes from here.
+  M: { rock: 0, nickelIron: 0.65, crystal: 0, platinum: 0.32, ice: 0, radioactive: 0.03 },
+  // "Dirty snowball" — mostly ice with real rock/dust content too, same as real comets.
+  Icy: { rock: 0.25, nickelIron: 0, crystal: 0, platinum: 0, ice: 0.68, radioactive: 0.07 },
+};
+
+/** Picks this body's actual resource mix from its type's weight table (see
+ *  RESOURCE_WEIGHTS_BY_TYPE) — a body's type determines what's possible, this determines which
+ *  specific cell gets which resource. */
+function makeCompositionPicker(type: AsteroidType) {
+  const weights = RESOURCE_WEIGHTS_BY_TYPE[type];
+  return (roll: number): Composition => weightedPick(weights, roll);
 }
 
 /** Bigger asteroids get proportionally more cells, but sublinearly — a large body should read
@@ -160,6 +255,40 @@ function seedCountForRadius(radius: number): number {
 export function scanSecondsForRadius(radius: number): number {
   const scaled = SCAN_HOLD_SECONDS * Math.sqrt(radius / ASTEROID_BASE_RADIUS);
   return Math.max(SCAN_SECONDS_MIN, Math.min(SCAN_SECONDS_MAX, scaled));
+}
+
+/** A chunk's actual cargo value from the physical area being extracted — a piece cut from a
+ *  huge cell should be worth more than the same resource cut from a sliver, not the same flat
+ *  amount either way. Sqrt-scaled around REFERENCE_CELL_AREA, same shape as
+ *  seedCountForRadius/scanSecondsForRadius: `baseValue` (COMPOSITION_INFO.chunkValue) applies
+ *  exactly at the reference area, less below it, more above it, but never linearly — an extreme
+ *  outlier cell shouldn't be able to overflow the whole cargo hold in one grab. Always at least 1
+ *  — even a sliver is worth something. */
+export function chunkValueForArea(baseValue: number, area: number): number {
+  return Math.max(1, Math.round(baseValue * Math.sqrt(area / REFERENCE_CELL_AREA)));
+}
+
+/** Real weight in kg for a given amount of a resource — the actual constraint on the cargo
+ *  hold's real, mass-limited capacity (see CARGO_CAPACITY_KG). Two resources can have the same
+ *  `amount` (roughly the same physical size, via chunkValueForArea) and still weigh very
+ *  differently, driven by COMPOSITION_INFO's real density figures — a hold full of Nickel-Iron
+ *  weighs much more than the same hold full of Water Ice, same as in reality. */
+export function weightKgFor(composition: Composition, amount: number): number {
+  return amount * COMPOSITION_INFO[composition].density * MATERIAL_WEIGHT_SCALE;
+}
+
+/** The single source of truth for "how much does this much rock actually weigh, physically" —
+ *  every place in the game that turns a polygon's area into a collision/rigid-body mass
+ *  (a cell, a group of cells, a loose chunk) goes through this, so a Nickel-Iron cell is exactly
+ *  as heavy as the Nickel-Iron chunk it becomes once extracted, not two disconnected numbers.
+ *  ROCK_MASS_PER_AREA is the baseline rate at ordinary rock's own density; every other resource
+ *  scales it by its real density relative to rock's (see COMPOSITION_INFO). */
+export function massPerAreaFor(composition: Composition): number {
+  return ROCK_MASS_PER_AREA * (COMPOSITION_INFO[composition].density / COMPOSITION_INFO.rock.density);
+}
+
+export function massForArea(composition: Composition, area: number): number {
+  return area * massPerAreaFor(composition);
 }
 
 /** Coarse human-readable size bucket for a radius — used for radar contact labels (see Engine's
@@ -271,7 +400,7 @@ let nextCellId = 1;
 
 export interface AsteroidOptions {
   radius?: number; // defaults to ASTEROID_BASE_RADIUS — the belt scatters a range of sizes
-  compositionWeights?: Record<Composition, number>; // lets one body skew ore-rich, another crystal-rich, etc.
+  type?: AsteroidType; // defaults to "S" — determines the resource mix, see RESOURCE_WEIGHTS_BY_TYPE
   // Overrides seedCountForRadius — a small standalone boulder (see Engine's belt scattering)
   // wants exactly 1 cell (the whole body, one mineable piece) rather than the handful the
   // normal size-based formula would still produce at a small-but-not-tiny radius.
@@ -286,6 +415,7 @@ export interface AsteroidOptions {
 export class Asteroid {
   center: Vec2;
   outerRadius: number; // approximate, used for range checks
+  type: AsteroidType; // spectral classification — determines possible resources, revealed on scan
   outline: Polygon;
   cells: Cell[];
   neighbors: Map<number, number[]>;
@@ -295,7 +425,8 @@ export class Asteroid {
 
   constructor(center: Vec2, rand: () => number = Math.random, options: AsteroidOptions = {}) {
     const radius = options.radius ?? ASTEROID_BASE_RADIUS;
-    const pickComposition = makeCompositionPicker(options.compositionWeights);
+    this.type = options.type ?? "S";
+    const pickComposition = makeCompositionPicker(this.type);
 
     this.center = center;
     this.outerRadius = radius;

@@ -1,9 +1,12 @@
 import {
   CHARGE_MAX_CARRIED,
+  CHARGE_POWER_PER_USE,
   CHARGE_RANGE,
   CHARGE_SIG_PER_USE,
+  DRILL_POWER_PER_SEC,
   DRILL_RANGE,
   DRILL_SIG_PER_SEC,
+  LASER_POWER_PER_SEC,
   LASER_RANGE,
   LASER_SIG_PER_SEC,
 } from "./constants";
@@ -21,6 +24,10 @@ export interface ToolDef {
   // wired up separately in the mining code.
   sigPerSecond?: number; // continuous-use tools (laser, drill) — cost accrues while active
   sigPerUse?: number; // one-shot tools (charges) — cost is per unit consumed, not time
+  // Battery draw (fuel-power-spec.md) — same continuous-vs-one-shot split as signature above,
+  // and same reasoning: the cost lives on the tool, not hand-matched at each call site.
+  powerPerSecond?: number;
+  powerPerUse?: number;
 }
 
 export const TOOLS: Record<ToolId, ToolDef> = {
@@ -30,6 +37,7 @@ export const TOOLS: Record<ToolId, ToolDef> = {
     label: "Laser",
     range: LASER_RANGE,
     sigPerSecond: LASER_SIG_PER_SEC,
+    powerPerSecond: LASER_POWER_PER_SEC,
   },
   drill: {
     id: "drill",
@@ -37,6 +45,7 @@ export const TOOLS: Record<ToolId, ToolDef> = {
     label: "Drill",
     range: DRILL_RANGE,
     sigPerSecond: DRILL_SIG_PER_SEC,
+    powerPerSecond: DRILL_POWER_PER_SEC,
   },
   charges: {
     id: "charges",
@@ -45,5 +54,6 @@ export const TOOLS: Record<ToolId, ToolDef> = {
     range: CHARGE_RANGE,
     maxCarried: CHARGE_MAX_CARRIED,
     sigPerUse: CHARGE_SIG_PER_USE,
+    powerPerUse: CHARGE_POWER_PER_USE,
   },
 };

@@ -23,6 +23,14 @@ export interface GravitySource {
   // warning-then-damage model built on top of it.
   heatRadius?: number; // beyond this, no thermal exposure at all
   heatIntensity?: number; // exposure at dist=0 — same falloff convention as pullStrength
+  // Solar power — a third, independent exposure value (fuel-power-spec.md), same optional-means-
+  // "radiates none" convention as heat. Deliberately NOT the same radius as heatRadius/pullRadius:
+  // those are short-range hazards (you have to be diving at the star to feel them), but real
+  // sunlight is useful at real interplanetary distances well past any hazard the star itself
+  // poses — solarRadius should reach out past the whole belt, while pullRadius/heatRadius stay
+  // tight and dangerous. A source can radiate light without heat/gravity or vice versa.
+  solarRadius?: number;
+  solarIntensity?: number; // exposure at dist=0 — same falloff convention as pullStrength
 }
 
 /** Acceleration `source` exerts on something at `pos` — zero once outside `pullRadius`. Linear
@@ -49,4 +57,17 @@ export function radiantHeatExposure(source: GravitySource, pos: Vec2): number {
   if (d >= source.heatRadius) return 0;
   const falloff = 1 - d / source.heatRadius;
   return source.heatIntensity * falloff;
+}
+
+/** Solar exposure `source` provides at `pos` — same shape/falloff as `radiantHeatExposure`, but
+ *  a wholly independent field/radius (see `GravitySource.solarRadius` doc comment): this is meant
+ *  to reach out much further than the heat/pull radii, so most of the system gets *some* solar
+ *  charge, with a real gradient toward the star, not just an all-or-nothing zone. Feeds
+ *  `Ship.battery` regen (see Engine's power handling) — not hull/temperature at all. */
+export function solarExposure(source: GravitySource, pos: Vec2): number {
+  if (!source.solarRadius || !source.solarIntensity) return 0;
+  const d = distance(source.pos, pos);
+  if (d >= source.solarRadius) return 0;
+  const falloff = 1 - d / source.solarRadius;
+  return source.solarIntensity * falloff;
 }

@@ -6,7 +6,7 @@ import { Vec2 } from "./vec2";
  * satellites, drones, enemies, and other ships should all be able to show up here later
  * without changing how ping/radar work.
  */
-export type ContactKind = "rock" | "hub" | "star";
+export type ContactKind = "rock" | "hub" | "star" | "satellite";
 
 export interface Contact {
   id: string; // stable across frames for a given physical thing, so "discovered" persists
